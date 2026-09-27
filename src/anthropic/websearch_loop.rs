@@ -299,7 +299,7 @@ async fn run_round(
     tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion =
-        match convert_request_with_mode_blocking(payload.clone(), tool_compatibility_mode).await {
+        match convert_request_with_mode_blocking(&payload, tool_compatibility_mode).await {
             Ok(c) => c,
             Err(e) => {
                 let (et, msg) = match &e {

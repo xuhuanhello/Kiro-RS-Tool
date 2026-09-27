@@ -375,8 +375,29 @@ async fn main() {
         tracing::info!("  GET  /admin");
     }
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            tracing::error!("无法监听 {}: {}", addr, e);
+            if e.kind() == std::io::ErrorKind::AddrInUse {
+                tracing::error!(
+                    "端口已被占用。请先停掉占用该端口的进程（例如另一个 kiro-rs 实例），\
+                     或修改 config.json 中的 host/port。"
+                );
+            } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+                tracing::error!(
+                    "权限不足。1024 以下端口需要特权；建议改用 1024 以上端口，\
+                     或保持默认的 127.0.0.1 回环地址。"
+                );
+            }
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app).await {
+        tracing::error!("HTTP 服务异常退出: {}", e);
+        std::process::exit(1);
+    }
 }
 
 /// 文件不存在时初始化配置/凭证文件

@@ -213,7 +213,15 @@ impl RequestTracer {
             cache_read_tokens: cache_read_tokens.max(0) as u64,
             attempts,
         };
-        store.insert(&rec);
+        // 写入放到阻塞线程池：SQLite 事务是同步阻塞调用，直接在 async worker
+        // 上跑会占住 worker 线程。失败或不在 runtime 内时退回同步写入。
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let store = std::sync::Arc::clone(store);
+                handle.spawn_blocking(move || store.insert(&rec));
+            }
+            Err(_) => store.insert(&rec),
+        }
     }
 }
 
@@ -331,20 +339,28 @@ fn validate_image_budget_or_response(
     }
 }
 
+/// 在阻塞上下文里执行协议转换。
+///
+/// 这里用 block_in_place 而不是 spawn_blocking：前者不需要 'static，调用方因此
+/// 不必为了满足所有权要求而 clone() 整个请求体（含 messages、tools schema 与
+/// base64 图片，实测可达上百 KB 到 MB 级）。block_in_place 会把同一 worker 上的
+/// 其他任务迁走，不会饿死 runtime。
+///
+/// 注意 block_in_place 只支持多线程 runtime，单线程下会 panic，故显式判断退化。
 pub(super) async fn convert_request_with_mode_blocking(
-    payload: MessagesRequest,
+    payload: &MessagesRequest,
     tool_compatibility_mode: crate::model::config::ToolCompatibilityMode,
 ) -> Result<ConversionResult, ConversionError> {
-    match tokio::task::spawn_blocking(move || {
-        convert_request_with_mode(&payload, tool_compatibility_mode)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => Err(ConversionError::InvalidImage(format!(
-            "image/request conversion task failed: {}",
-            e
-        ))),
+    use tokio::runtime::{Handle, RuntimeFlavor};
+
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| {
+                convert_request_with_mode(payload, tool_compatibility_mode)
+            })
+        }
+        // 无 runtime 或单线程 runtime：直接同步执行
+        _ => convert_request_with_mode(payload, tool_compatibility_mode),
     }
 }
 
@@ -777,7 +793,7 @@ pub async fn post_messages(
 
     // 转换请求
     let conversion_result =
-        match convert_request_with_mode_blocking(payload.clone(), state.tool_compatibility_mode)
+        match convert_request_with_mode_blocking(&payload, state.tool_compatibility_mode)
             .await
         {
             Ok(result) => result,
@@ -1725,7 +1741,7 @@ pub async fn post_messages_cc(
 
     // 转换请求
     let conversion_result =
-        match convert_request_with_mode_blocking(payload.clone(), state.tool_compatibility_mode)
+        match convert_request_with_mode_blocking(&payload, state.tool_compatibility_mode)
             .await
         {
             Ok(result) => result,

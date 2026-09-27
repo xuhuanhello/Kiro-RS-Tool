@@ -1805,12 +1805,13 @@ impl BufferedStreamContext {
 ///
 /// 公开供 cache_meter 等模块复用同一估算口径。
 pub fn estimate_tokens(text: &str) -> i32 {
-    let chars: Vec<char> = text.chars().collect();
-    let mut chinese_count = 0;
-    let mut other_count = 0;
+    let mut chinese_count: i32 = 0;
+    let mut other_count: i32 = 0;
 
-    for c in &chars {
-        if *c >= '\u{4E00}' && *c <= '\u{9FFF}' {
+    // 单遍迭代，避免为每个分片都做一次 Vec<char> 堆分配
+    // （流式响应里本函数按分片调用，长回答可达数百次）
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) {
             chinese_count += 1;
         } else {
             other_count += 1;

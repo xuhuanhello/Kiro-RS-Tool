@@ -539,6 +539,9 @@ pub struct SseStateManager {
     stop_reason: Option<String>,
     /// 是否有工具调用
     has_tool_use: bool,
+    /// 需要随 message_delta 回传的 safeguard_results
+    /// （auto 模式「服务端分类器审查」，见 anthropic::safeguards）
+    safeguard_results: Option<serde_json::Value>,
 }
 
 impl Default for SseStateManager {
@@ -557,7 +560,16 @@ impl SseStateManager {
             next_block_index: 0,
             stop_reason: None,
             has_tool_use: false,
+            safeguard_results: None,
         }
+    }
+
+    /// 设置要随 message_delta 回传的 safeguard_results
+    ///
+    /// 客户端在 auto 模式下要求服务端审查时，**每一个**响应都必须带上该字段，
+    /// 否则客户端会把网关判定为不兼容并回退（并展示分类器计费提示）。
+    pub fn set_safeguard_results(&mut self, results: serde_json::Value) {
+        self.safeguard_results = Some(results);
     }
 
     /// 判断指定块是否处于可接收 delta 的打开状态
@@ -728,14 +740,20 @@ impl SseStateManager {
         // 发送 message_delta
         if !self.message_delta_sent {
             self.message_delta_sent = true;
+            let mut delta = json!({
+                "stop_reason": self.get_stop_reason(),
+                "stop_sequence": null
+            });
+            if let Some(results) = self.safeguard_results.take()
+                && let Some(obj) = delta.as_object_mut()
+            {
+                obj.insert("safeguard_results".to_string(), results);
+            }
             events.push(SseEvent::new(
                 "message_delta",
                 json!({
                     "type": "message_delta",
-                    "delta": {
-                        "stop_reason": self.get_stop_reason(),
-                        "stop_sequence": null
-                    },
+                    "delta": delta,
                     "usage": {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
@@ -805,6 +823,10 @@ pub struct StreamContext {
     pub credits: f64,
     /// Kiro toolUseEvent.input JSON 聚合器
     pub tool_json_accumulator: ToolJsonAccumulator,
+    /// 本次响应中完成的工具调用 (id, name, input)
+    ///
+    /// 供 auto 模式「服务端分类器审查」在流结束时跑真实分类使用。
+    pub collected_tool_uses: Vec<(String, String, serde_json::Value)>,
     /// 上游工具 JSON 解析错误
     pub tool_json_error: Option<ToolJsonAccumulatorError>,
     tool_use_xml_filter: ToolUseXmlLeakFilter,
@@ -845,6 +867,7 @@ impl StreamContext {
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
             tool_json_accumulator: ToolJsonAccumulator::new(),
+            collected_tool_uses: Vec::new(),
             tool_json_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
@@ -1448,6 +1471,13 @@ impl StreamContext {
             }
         };
 
+        // 记录完成的工具调用，供 safeguards 分类器在流结束时使用
+        self.collected_tool_uses.push((
+            completed.id.clone(),
+            completed.name.clone(),
+            completed.input.clone(),
+        ));
+
         // 获取或分配块索引
         let block_index = if let Some(&idx) = self.tool_block_indices.get(&completed.id) {
             idx
@@ -1670,6 +1700,11 @@ pub struct BufferedStreamContext {
 }
 
 impl BufferedStreamContext {
+    /// 设置要随 message_delta 回传的 safeguard_results
+    pub fn set_safeguard_results(&mut self, results: serde_json::Value) {
+        self.inner.state_manager.set_safeguard_results(results);
+    }
+
     /// 创建缓冲流上下文
     pub fn new(
         model: impl Into<String>,

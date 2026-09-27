@@ -615,7 +615,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         assert!(has_web_search_tool(&req));
     }
@@ -655,7 +656,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         // 多个工具时不应该被识别为纯 websearch 请求
         assert!(!has_web_search_tool(&req));
@@ -682,7 +684,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let query = extract_search_query(&req);
         // 前缀应该被去除
@@ -708,7 +711,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let query = extract_search_query(&req);
         assert_eq!(query, None);
@@ -742,7 +746,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         assert_eq!(extract_search_query(&req), None);
         assert!(!is_direct_web_search_request(&req));

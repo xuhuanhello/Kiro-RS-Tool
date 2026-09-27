@@ -267,11 +267,21 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // auto 模式服务端审查的真实分类器（阶段 2，默认关闭）
+    let safeguards_classifier = config.safeguards_classifier_enabled.then(|| {
+        anthropic::safeguards::ClassifierSettings {
+            model: config.safeguards_classifier_model.clone(),
+            timeout: std::time::Duration::from_secs(config.safeguards_classifier_timeout_secs),
+        }
+    });
+
     let anthropic_app = anthropic::create_router_with_shared_key(
         shared_api_key.clone(),
         Some(kiro_provider.clone()),
         config.extract_thinking,
         config.tool_compatibility_mode,
+        config.safeguards_enabled,
+        safeguards_classifier,
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),

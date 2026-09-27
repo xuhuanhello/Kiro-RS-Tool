@@ -692,6 +692,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
+    safeguards: super::safeguards::SafeguardsPlan,
     cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
@@ -701,6 +702,7 @@ pub(super) async fn run_web_search_loop(
             payload,
             hook,
             tool_compatibility_mode,
+            safeguards,
             cache_plan,
             tracer,
         )
@@ -731,11 +733,53 @@ pub(super) async fn run_web_search_loop(
     }
 }
 
+/// 按 safeguards 计划产出本响应的 safeguard_results
+///
+/// 安全约束：只有真实分类产出的裁决才会以 evaluated 形式下发；分类失败或未
+/// 覆盖的工具一律不下发（空表），由客户端自己的分类器兜底。
+async fn build_safeguard_results(
+    provider: &Arc<KiroProvider>,
+    safeguards: &super::safeguards::SafeguardsPlan,
+    content: &[Value],
+) -> Option<Value> {
+    use super::safeguards::SafeguardsPlan;
+
+    match safeguards {
+        SafeguardsPlan::Off => None,
+        SafeguardsPlan::Deferred => Some(super::safeguards::deferred_results()),
+        SafeguardsPlan::Classify(settings) => {
+            let tool_uses: Vec<(String, String, Value)> = content
+                .iter()
+                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+                .filter_map(|b| {
+                    Some((
+                        b.get("id")?.as_str()?.to_string(),
+                        b.get("name")?.as_str()?.to_string(),
+                        b.get("input").cloned().unwrap_or(Value::Null),
+                    ))
+                })
+                .collect();
+
+            if tool_uses.is_empty() {
+                return Some(super::safeguards::deferred_results());
+            }
+
+            let verdicts = super::safeguards::classify(provider, settings, &tool_uses).await;
+            if verdicts.is_empty() {
+                Some(super::safeguards::deferred_results())
+            } else {
+                Some(super::safeguards::build_results(&verdicts))
+            }
+        }
+    }
+}
+
 async fn render_deferred_sse(
     provider: Arc<KiroProvider>,
     payload: MessagesRequest,
     hook: UsageRecordHook,
     tool_compatibility_mode: ToolCompatibilityMode,
+    safeguards: super::safeguards::SafeguardsPlan,
     cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
@@ -744,6 +788,8 @@ async fn render_deferred_sse(
 
     tokio::spawn(async move {
         let mut marker = StreamFirstByteMarker::new(tx.clone(), startup_tx);
+        // 分类器需要在流结束时再调一次模型，先留一份 provider
+        let provider_for_classifier = provider.clone();
         let result = run_web_search_loop_inner(
             provider,
             payload,
@@ -758,6 +804,12 @@ async fn render_deferred_sse(
         match result {
             Ok(success) => {
                 marker.mark_started_before_final_flush();
+                let safeguard_results = build_safeguard_results(
+                    &provider_for_classifier,
+                    &safeguards,
+                    &success.content,
+                )
+                .await;
                 for event in build_sse_events(
                     &success.model,
                     success.content,
@@ -766,6 +818,7 @@ async fn render_deferred_sse(
                     success.output_tokens,
                     success.cache_creation_tokens,
                     success.cache_read_tokens,
+                    safeguard_results,
                 ) {
                     if tx
                         .send(Ok(Bytes::from(event.to_sse_string())))
@@ -851,6 +904,7 @@ fn build_sse_events(
     output_tokens: i32,
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
+    safeguards: Option<Value>,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
@@ -997,11 +1051,17 @@ fn build_sse_events(
         }
     }
 
+    let mut delta = json!({ "stop_reason": stop_reason });
+    if let Some(results) = safeguards
+        && let Some(obj) = delta.as_object_mut()
+    {
+        obj.insert("safeguard_results".to_string(), results);
+    }
     events.push(SseEvent::new(
         "message_delta",
         json!({
             "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
+            "delta": delta,
             "usage": {
                 "output_tokens": output_tokens,
                 "cache_creation_input_tokens": cache_creation_tokens,
@@ -1163,7 +1223,8 @@ mod tests {
             json!({"type": "text", "text": "done"}),
             json!({"type": "tool_use", "id": "toolu_exec", "name": "exec", "input": {"cmd": "ls"}}),
         ];
-        let events = build_sse_events("claude-opus-4-8", content, "tool_use", 10, 5, 3, 2);
+        let events = build_sse_events("claude-opus-4-8", content, "tool_use", 10, 5, 3, 2,
+            None);
 
         // Must contain message_start / message_delta(stop_reason) / message_stop
         assert_eq!(events.first().unwrap().event, "message_start");
@@ -1210,7 +1271,8 @@ mod tests {
             "type": "redacted_thinking",
             "data": "encrypted-thinking"
         })];
-        let events = build_sse_events("claude-opus-4-8", content, "end_turn", 10, 5, 0, 0);
+        let events = build_sse_events("claude-opus-4-8", content, "end_turn", 10, 5, 0, 0,
+            None);
 
         let start = events
             .iter()
@@ -1241,6 +1303,7 @@ mod tests {
             7,
             45,
             67,
+            None,
         );
 
         let start = events

@@ -435,6 +435,60 @@ fn resolve_usage_input_tokens(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-opus-5-5".to_string(),
+            object: "model".to_string(),
+            created: 1788998400, // Sep 10, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-opus-5-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1788998400, // Sep 10, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5.5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1785888000, // Aug 5, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-opus-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1785888000, // Aug 5, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128000,
+        },
+        Model {
+            id: "claude-sonnet-5".to_string(),
+            object: "model".to_string(),
+            created: 1785888000, // Aug 5, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1785888000, // Aug 5, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 5 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "claude-opus-4-8".to_string(),
             object: "model".to_string(),
             created: 1779897600, // May 28, 2026
@@ -703,12 +757,18 @@ pub async fn post_messages(
             payload.model.clone(),
             payload_stream,
         ));
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
             payload_stream,
             state.tool_compatibility_mode,
+            safeguards,
             cache_plan,
             tracer,
         )
@@ -779,12 +839,18 @@ pub async fn post_messages(
             payload.model.clone(),
             true,
         ));
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         handle_stream_request(
             provider,
             &request_body,
             &payload.model,
             total_input_tokens,
             thinking_enabled,
+            safeguards,
             tool_name_map,
             hook,
             cache_plan,
@@ -822,6 +888,7 @@ async fn handle_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    safeguards: super::safeguards::SafeguardsPlan,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     cache_plan: CacheUsagePlan,
@@ -833,6 +900,7 @@ async fn handle_stream_request(
         model.to_string(),
         input_tokens,
         thinking_enabled,
+        safeguards,
         tool_name_map,
         hook,
         cache_plan,
@@ -880,11 +948,15 @@ fn create_deferred_sse_stream(
     model: String,
     input_tokens: i32,
     thinking_enabled: bool,
+    safeguards: super::safeguards::SafeguardsPlan,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     cache_plan: CacheUsagePlan,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> ByteStream {
+    // 分类器需要在流结束时再调一次模型，因此保留一份 provider
+    let provider_for_classifier = provider.clone();
+
     // CCH records TTFB when the first downstream byte arrives. Do not emit a
     // synthetic prelude here; the first downstream byte is delayed until the
     // upstream response body yields real bytes.
@@ -915,12 +987,22 @@ fn create_deferred_sse_stream(
         let mut ctx =
             StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
         ctx.cache_usage = cache_plan.usage();
+        // auto 模式服务端分类器审查：客户端要求时，每个响应都必须回传
+        // safeguard_results，否则客户端会判定网关不兼容并展示计费提示。
+        if !matches!(safeguards, super::safeguards::SafeguardsPlan::Off) {
+            // 先放一份空裁决：即使随后真实分类失败，客户端也只会回退到自己的
+            // 分类器，而不会重新出现「网关不兼容」提示。
+            ctx.state_manager
+                .set_safeguard_results(super::safeguards::deferred_results());
+        }
 
         let initial_events = ctx.generate_initial_events();
         Box::pin(create_sse_stream(
+            provider_for_classifier,
             response,
             ctx,
             initial_events,
+            safeguards,
             hook,
             credential_id,
             tracer,
@@ -933,10 +1015,13 @@ fn create_deferred_sse_stream(
 }
 
 /// 创建 SSE 事件流
+#[allow(clippy::too_many_arguments)]
 fn create_sse_stream(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    safeguards: super::safeguards::SafeguardsPlan,
     hook: UsageRecordHook,
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
@@ -959,8 +1044,10 @@ fn create_sse_stream(
             0u64,
             cache_plan,
             Some(initial_events),
+            provider,
+            safeguards,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, cache_plan, mut pending_initial_events)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, cache_plan, mut pending_initial_events, provider, safeguards)| async move {
             if finished {
                 return None;
             }
@@ -1002,7 +1089,7 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events, provider, safeguards)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
@@ -1021,10 +1108,28 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events, provider, safeguards)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            // 流结束：先按需跑真实分类器，再生成最终事件。
+                            // 分类失败时保留先前写入的空裁决表，客户端会回退到
+                            // 自己的分类器——绝不会因此放行任何未经审查的动作。
+                            if let super::safeguards::SafeguardsPlan::Classify(settings) = &safeguards
+                                && !ctx.collected_tool_uses.is_empty()
+                            {
+                                let verdicts = super::safeguards::classify(
+                                    &provider,
+                                    settings,
+                                    &ctx.collected_tool_uses,
+                                )
+                                .await;
+                                if !verdicts.is_empty() {
+                                    ctx.state_manager.set_safeguard_results(
+                                        super::safeguards::build_results(&verdicts),
+                                    );
+                                }
+                            }
+
                             let mut final_events = pending_initial_events.take().unwrap_or_default();
                             final_events.extend(ctx.generate_final_events());
                             let tool_json_error = ctx.tool_json_error_message();
@@ -1040,7 +1145,7 @@ fn create_sse_stream(
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events, provider, safeguards)))
                         }
                     }
                 }
@@ -1048,7 +1153,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick(), if pending_initial_events.is_none() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events, provider, safeguards)))
                 }
             }
         },
@@ -1600,12 +1705,18 @@ pub async fn post_messages_cc(
             payload.model.clone(),
             payload_stream,
         ));
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         return super::websearch_loop::run_web_search_loop(
             provider,
             payload,
             hook,
             payload_stream,
             state.tool_compatibility_mode,
+            safeguards,
             cache_plan,
             tracer,
         )
@@ -1676,11 +1787,17 @@ pub async fn post_messages_cc(
             payload.model.clone(),
             true,
         ));
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         handle_stream_request_buffered(
             provider,
             &request_body,
             &payload.model,
             thinking_enabled,
+            safeguards,
             tool_name_map,
             hook,
             total_input_tokens,
@@ -1721,6 +1838,7 @@ async fn handle_stream_request_buffered(
     request_body: &str,
     model: &str,
     thinking_enabled: bool,
+    safeguards: super::safeguards::SafeguardsPlan,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
@@ -1732,6 +1850,7 @@ async fn handle_stream_request_buffered(
         request_body.to_string(),
         model.to_string(),
         thinking_enabled,
+        safeguards,
         tool_name_map,
         hook,
         fallback_input_tokens,
@@ -1755,6 +1874,7 @@ fn create_deferred_buffered_sse_stream(
     request_body: String,
     model: String,
     thinking_enabled: bool,
+    safeguards: super::safeguards::SafeguardsPlan,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
@@ -1794,6 +1914,9 @@ fn create_deferred_buffered_sse_stream(
             tool_name_map,
         );
         ctx.set_cache_usage(cache_plan.usage());
+        if !matches!(safeguards, super::safeguards::SafeguardsPlan::Off) {
+            ctx.set_safeguard_results(super::safeguards::deferred_results());
+        }
 
         Box::pin(create_buffered_sse_stream(
             response,

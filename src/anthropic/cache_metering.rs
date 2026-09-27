@@ -956,7 +956,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        }
+                    safeguards: None,
+}
     }
 
     #[test]
@@ -1034,7 +1035,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
         let u = compute_cache_usage(&cache, &req, 1);
         assert_eq!(u.cache_covered_est, 0);
         assert_eq!(u.split_against_total(123), (123, 0, 0));
@@ -1098,7 +1100,8 @@ mod tests {
                 thinking: None,
                 output_config: None,
                 metadata: None,
-            }
+                            safeguards: None,
+}
         };
 
         let cache = new_shared_cache();
@@ -1149,7 +1152,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        }
+                    safeguards: None,
+}
     }
 
     /// 模拟 Claude Code 真实工具调用序列：tool_use(assistant) / tool_result(user)
@@ -1437,7 +1441,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let cache = new_shared_cache();
         // Turn 1：动态头 = "now=1001"，3 条消息。
@@ -1510,7 +1515,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let u = compute_cache_usage(&new_shared_cache(), &req, 1);
         assert!(
@@ -1579,7 +1585,8 @@ mod tests {
             metadata: Some(Metadata {
                 user_id: Some(format!("user_abc_account__session_{session}")),
             }),
-        };
+                    safeguards: None,
+};
         let cache = new_shared_cache();
         // 同 key_id（都为 0），仅 session 不同——靠 metadata session 隔离。
         let s1a = compute_cache_usage(&cache, &make("aaa"), 0);
@@ -1679,7 +1686,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
         let cache = new_shared_cache();
         let u = compute_cache_usage(&cache, &req, 1);
         // 历史段（第一条）的 covered 应严格等于纯文本 estimate——
@@ -1731,7 +1739,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let cache = new_shared_cache();
         // Turn 1：含图的 user 是历史第一段，其 covered 必须包含图片 token。

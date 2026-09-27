@@ -141,6 +141,13 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// auto 模式的「服务端分类器审查」请求（Claude Code 的 safeguards 字段）。
+    ///
+    /// 仅当客户端在 auto 模式下启用服务端审查时出现。存在即表示：
+    /// 客户端期望**每一个**响应都在 message_delta 里回传 safeguard_results。
+    /// 保留原始值以便未来解析 classifier_context。
+    #[serde(default)]
+    pub safeguards: Option<serde_json::Value>,
 }
 
 /// 反序列化 system 字段，支持字符串或数组格式

@@ -304,6 +304,35 @@ pub struct Config {
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
+    /// auto 模式「服务端分类器审查」支持（safeguards / safeguard_results）。
+    ///
+    /// 开启后，当 Claude Code 在 auto 模式下请求服务端审查时，代理会在**每一个**
+    /// 响应的 message_delta 里回传 safeguard_results，使该会话保持「合格」状态，
+    /// 不再出现分类器计费提示（auto-mode-classifier-billing）。
+    ///
+    /// 当前实现不产出任何真实裁决：每个工具都交回 Claude Code 自己的分类器审查，
+    /// 因此安全语义与开启前完全一致（实测：缺裁决时客户端回退本地分类器）。
+    #[serde(default = "default_safeguards_enabled")]
+    pub safeguards_enabled: bool,
+
+    /// auto 模式服务端审查：是否启用**真实分类器**判定（阶段 2）。
+    ///
+    /// 关闭（默认）时只回传空裁决表，每个动作仍由 Claude Code 自己的分类器审查，
+    /// 安全语义与不接入服务端审查时完全一致。
+    /// 开启后，shell 类工具调用会额外走一次模型判定：判为安全则下发
+    /// not_flagged（客户端不再重复检查），判为危险则 flagged（拦截）。
+    /// 分类失败/超时一律不下发裁决，由客户端本地兜底。
+    #[serde(default)]
+    pub safeguards_classifier_enabled: bool,
+
+    /// 真实分类器使用的模型
+    #[serde(default = "default_safeguards_classifier_model")]
+    pub safeguards_classifier_model: String,
+
+    /// 真实分类器单次判定超时（秒）
+    #[serde(default = "default_safeguards_classifier_timeout_secs")]
+    pub safeguards_classifier_timeout_secs: u64,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -395,6 +424,18 @@ fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
     ToolCompatibilityMode::ClaudeCode
 }
 
+fn default_safeguards_enabled() -> bool {
+    true
+}
+
+fn default_safeguards_classifier_model() -> String {
+    "claude-sonnet-5".to_string()
+}
+
+fn default_safeguards_classifier_timeout_secs() -> u64 {
+    20
+}
+
 fn default_trace_enabled() -> bool {
     true
 }
@@ -441,6 +482,10 @@ impl Default for Config {
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
+            safeguards_enabled: default_safeguards_enabled(),
+            safeguards_classifier_enabled: false,
+            safeguards_classifier_model: default_safeguards_classifier_model(),
+            safeguards_classifier_timeout_secs: default_safeguards_classifier_timeout_secs(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),

@@ -40,6 +40,10 @@ pub struct AppState {
     pub extract_thinking: bool,
     /// 工具兼容模式
     pub tool_compatibility_mode: ToolCompatibilityMode,
+    /// auto 模式「服务端分类器审查」支持（safeguards / safeguard_results）
+    pub safeguards_enabled: bool,
+    /// 真实分类器设置；None 表示只回传空裁决（交回客户端本地分类）
+    pub safeguards_classifier: Option<super::safeguards::ClassifierSettings>,
     /// 客户端 Key 管理器（可选，未启用 Admin 时为 None）
     pub client_keys: Option<SharedClientKeyManager>,
     /// 用量日志记录器
@@ -68,6 +72,8 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             tool_compatibility_mode,
+            safeguards_enabled: true,
+            safeguards_classifier: None,
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
@@ -87,12 +93,29 @@ impl AppState {
             kiro_provider: None,
             extract_thinking,
             tool_compatibility_mode,
+            safeguards_enabled: true,
+            safeguards_classifier: None,
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
         }
+    }
+
+    /// 设置是否启用 auto 模式「服务端分类器审查」支持
+    pub fn with_safeguards(mut self, enabled: bool) -> Self {
+        self.safeguards_enabled = enabled;
+        self
+    }
+
+    /// 设置真实分类器（阶段 2）；None 表示只回传空裁决
+    pub fn with_safeguards_classifier(
+        mut self,
+        classifier: Option<super::safeguards::ClassifierSettings>,
+    ) -> Self {
+        self.safeguards_classifier = classifier;
+        self
     }
 
     /// 设置 KiroProvider

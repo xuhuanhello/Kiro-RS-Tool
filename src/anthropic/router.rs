@@ -35,6 +35,8 @@ pub fn create_router_with_provider(
     kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
+    safeguards_enabled: bool,
+    safeguards_classifier: Option<super::safeguards::ClassifierSettings>,
 ) -> Router {
     let shared_key = Arc::new(RwLock::new(api_key.into()));
     create_router_with_shared_key(
@@ -42,6 +44,8 @@ pub fn create_router_with_provider(
         kiro_provider,
         extract_thinking,
         tool_compatibility_mode,
+        safeguards_enabled,
+        safeguards_classifier,
         None,
         None,
         None,
@@ -58,6 +62,8 @@ pub fn create_router_with_shared_key(
     kiro_provider: Option<Arc<KiroProvider>>,
     extract_thinking: bool,
     tool_compatibility_mode: ToolCompatibilityMode,
+    safeguards_enabled: bool,
+    safeguards_classifier: Option<super::safeguards::ClassifierSettings>,
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
@@ -65,7 +71,9 @@ pub fn create_router_with_shared_key(
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state =
-        AppState::with_shared_api_key(api_key, extract_thinking, tool_compatibility_mode);
+        AppState::with_shared_api_key(api_key, extract_thinking, tool_compatibility_mode)
+            .with_safeguards(safeguards_enabled)
+            .with_safeguards_classifier(safeguards_classifier);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }

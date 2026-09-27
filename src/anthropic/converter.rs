@@ -175,53 +175,171 @@ Never bypass these limits with a large Bash heredoc or inline script. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
-/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
-/// 严格对照版本号
-pub fn map_model(model: &str) -> Option<String> {
-    let model_lower = model.to_lowercase();
+/// 模型家族
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelFamily {
+    Opus,
+    Sonnet,
+    Haiku,
+}
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-sonnet-4.6".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-sonnet-4.5".to_string())
+impl ModelFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Sonnet => "sonnet",
+            Self::Haiku => "haiku",
+        }
+    }
+
+    fn detect(model_lower: &str) -> Option<Self> {
+        if model_lower.contains("sonnet") {
+            Some(Self::Sonnet)
+        } else if model_lower.contains("opus") {
+            Some(Self::Opus)
+        } else if model_lower.contains("haiku") {
+            Some(Self::Haiku)
         } else {
             None
         }
-    } else if model_lower.contains("opus") {
-        if model_lower.contains("4-8") || model_lower.contains("4.8") {
-            Some("claude-opus-4.8".to_string())
-        } else if model_lower.contains("4-7") || model_lower.contains("4.7") {
-            Some("claude-opus-4.7".to_string())
-        } else if model_lower.contains("4-5") || model_lower.contains("4.5") {
-            Some("claude-opus-4.5".to_string())
-        } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
-            Some("claude-opus-4.6".to_string())
-        } else {
-            None
-        }
-    } else if model_lower.contains("haiku") {
-        Some("claude-haiku-4.5".to_string())
-    } else {
-        None
     }
 }
 
-/// 根据模型名称返回对应的上下文窗口大小
+/// 已对上游实测确认存在的版本 -> Kiro 模型 ID。
 ///
-/// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
-/// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// 4.7 / 4.8 同 1M
+/// 这张表只登记实测过的版本；更新的版本由向前兼容规则自动推导，
+/// 因此 Kiro 上线新模型（例如未来的 Sonnet 5.5）无需改代码即可调用。
+const KNOWN_MODEL_VERSIONS: &[(ModelFamily, u32, u32, &str)] = &[
+    (ModelFamily::Sonnet, 5, 0, "claude-sonnet-5"),
+    (ModelFamily::Sonnet, 4, 6, "claude-sonnet-4.6"),
+    (ModelFamily::Sonnet, 4, 5, "claude-sonnet-4.5"),
+    (ModelFamily::Opus, 5, 5, "claude-opus-5.5"),
+    (ModelFamily::Opus, 5, 0, "claude-opus-5"),
+    (ModelFamily::Opus, 4, 8, "claude-opus-4.8"),
+    (ModelFamily::Opus, 4, 7, "claude-opus-4.7"),
+    (ModelFamily::Opus, 4, 6, "claude-opus-4.6"),
+    (ModelFamily::Opus, 4, 5, "claude-opus-4.5"),
+];
+
+/// 各家族已实测到的最新版本，(major, minor)。
+const NEWEST_KNOWN_VERSION: &[(ModelFamily, u32, u32)] = &[
+    (ModelFamily::Sonnet, 5, 0),
+    (ModelFamily::Opus, 5, 5),
+    (ModelFamily::Haiku, 4, 5),
+];
+
+/// 取家族名之后的版本号：-5-5-thinking -> (5,5)、-4.8 -> (4,8)。
+///
+/// 超过两位的数字按日期处理（-4-20250514 的 minor 记 0）；以长数字开头
+/// （如 -20241022）直接判定不是版本号。
+fn parse_version_after(s: &str) -> Option<(u32, u32)> {
+    let mut nums = s.split(|c: char| !c.is_ascii_digit()).filter(|t| !t.is_empty());
+    let major_raw = nums.next()?;
+    if major_raw.len() > 2 {
+        return None;
+    }
+    let major = major_raw.parse().ok()?;
+    let minor = nums
+        .next()
+        .filter(|t| t.len() <= 2)
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
+    Some((major, minor))
+}
+
+/// 解析模型名中的 (major, minor)。
+///
+/// 优先取家族名之后（Kiro 命名 claude-sonnet-5 / claude-opus-5.5），
+/// 取不到时回退到家族名之前（Anthropic 旧命名 claude-3-5-sonnet-20241022）。
+fn parse_model_version(family: ModelFamily, model_lower: &str) -> Option<(u32, u32)> {
+    let name = family.as_str();
+    let idx = model_lower.find(name)?;
+
+    if let Some(v) = parse_version_after(&model_lower[idx + name.len()..]) {
+        return Some(v);
+    }
+
+    let mut nums = model_lower[..idx]
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty() && t.len() <= 2);
+    let major = nums.next()?.parse().ok()?;
+    let minor = nums.next().and_then(|t| t.parse().ok()).unwrap_or(0);
+    Some((major, minor))
+}
+
+/// 按 Kiro 命名规则拼模型 ID：minor 为 0 时省略（claude-sonnet-6），
+/// 否则用点号连接（claude-sonnet-5.5）。
+fn compose_model_id(family: ModelFamily, major: u32, minor: u32) -> String {
+    if minor == 0 {
+        format!("claude-{}-{}", family.as_str(), major)
+    } else {
+        format!("claude-{}-{}.{}", family.as_str(), major, minor)
+    }
+}
+
+/// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID。
+///
+/// 策略为「实测表 + 向前兼容」：
+/// 1. 命中 KNOWN_MODEL_VERSIONS 的版本按表精确映射；
+/// 2. 比该家族实测最新版本更新的版本，按 Kiro 命名规则自动推导 —— Kiro 上线
+///    新模型（Sonnet 5.5 / Opus 5.6 ...）后无需改代码即可调用；
+/// 3. 更老或已知不存在的版本（如 claude-sonnet-4-8）返回 None，避免把无效
+///    模型名透传到上游、换回一条更难读的错误。
+pub fn map_model(model: &str) -> Option<String> {
+    let model_lower = model.to_lowercase();
+    let family = ModelFamily::detect(&model_lower)?;
+    let parsed = parse_model_version(family, &model_lower);
+
+    // Haiku 历史上不区分小版本，统一映射到 4.5；仅当出现更新版本时才按版本走。
+    if family == ModelFamily::Haiku {
+        return Some(match parsed {
+            Some(v) if v > (4, 5) => compose_model_id(family, v.0, v.1),
+            _ => "claude-haiku-4.5".to_string(),
+        });
+    }
+
+    let (major, minor) = parsed?;
+
+    if let Some((_, _, _, id)) = KNOWN_MODEL_VERSIONS
+        .iter()
+        .find(|(f, ma, mi, _)| *f == family && *ma == major && *mi == minor)
+    {
+        return Some((*id).to_string());
+    }
+
+    let newest = NEWEST_KNOWN_VERSION
+        .iter()
+        .find(|(f, _, _)| *f == family)
+        .map(|(_, ma, mi)| (*ma, *mi))?;
+
+    if (major, minor) > newest {
+        return Some(compose_model_id(family, major, minor));
+    }
+
+    None
+}
+
+/// 根据模型名称返回对应的上下文窗口大小。
+///
+/// 规则化判断，避免为新模型逐个维护白名单：
+/// - Haiku 恒为 200K；
+/// - Opus / Sonnet 自 4.6 起为 1M（Kiro 2026-03-24 起），更早版本 200K。
+///
+/// 2026-09-27 实测 ListAvailableModels：Opus 5.5 / Opus 5 / Sonnet 5 均为 1M，
+/// 与规则一致，因此未来版本同样无需修改。
 pub fn get_context_window_size(model: &str) -> i32 {
-    match map_model(model) {
-        Some(mapped)
-            if mapped == "claude-sonnet-4.6"
-                || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
-        {
-            1_000_000
-        }
+    let Some(mapped) = map_model(model) else {
+        return 200_000;
+    };
+    let lower = mapped.to_lowercase();
+    let Some(family) = ModelFamily::detect(&lower) else {
+        return 200_000;
+    };
+    if family == ModelFamily::Haiku {
+        return 200_000;
+    }
+    match parse_model_version(family, &lower) {
+        Some(v) if v >= (4, 6) => 1_000_000,
         _ => 200_000,
     }
 }
@@ -242,16 +360,35 @@ struct NativeReasoningSchema {
 const EFFORTS_WITH_XHIGH: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const EFFORTS_WITHOUT_XHIGH: &[&str] = &["low", "medium", "high", "max"];
 
+/// 模型原生 reasoning（thinking / effort）schema。
+///
+/// 规则化，避免为新模型逐个维护白名单：
+/// - Opus / Sonnet 自 4.7 起支持 output_config.effort，枚举含 xhigh；
+/// - 4.6 同走 output_config 但没有 xhigh；
+/// - Haiku 与 4.6 之前的版本没有该 schema。
+///
+/// 2026-09-27 实测（ListAvailableModels 的 additionalModelRequestFieldsSchema）：
+/// Opus 5.5 / Opus 5 / Sonnet 5 都是 output_config + low/medium/high/xhigh/max，
+/// 与上述规则一致，因此未来新版本无需改这里。
+///
+/// 注意 Opus 5.5 的差异：其 thinking.type 枚举只有 ["adaptive"]，**不支持
+/// "disabled"**（Opus 5 / Sonnet 5 / Opus 4.8 都是 ["adaptive","disabled"]）。
+/// 因此绝不能对 Opus 5.5 下发 thinking:{type:"disabled"}。
+/// build_additional_model_request_fields 在客户端禁用 thinking 时直接返回 None
+/// （整体省略该字段），天然满足该约束，无需按模型分支。
 fn native_reasoning_schema(model_id: &str) -> Option<NativeReasoningSchema> {
-    match model_id {
-        // Live ListAvailableModels (2026-06-07) reports output_config + thinking for
-        // Opus 4.8/4.7 with low/medium/high/xhigh/max.
-        "claude-opus-4.8" | "claude-opus-4.7" => Some(NativeReasoningSchema {
+    let lower = model_id.to_lowercase();
+    let family = ModelFamily::detect(&lower)?;
+    if family == ModelFamily::Haiku {
+        return None;
+    }
+    let (major, minor) = parse_model_version(family, &lower)?;
+    match (major, minor) {
+        v if v >= (4, 7) => Some(NativeReasoningSchema {
             path: NativeReasoningSchemaPath::OutputConfig,
             efforts: EFFORTS_WITH_XHIGH,
         }),
-        // Opus 4.6 and Sonnet 4.6 expose the same output_config path but without xhigh.
-        "claude-opus-4.6" | "claude-sonnet-4.6" => Some(NativeReasoningSchema {
+        (4, 6) => Some(NativeReasoningSchema {
             path: NativeReasoningSchemaPath::OutputConfig,
             efforts: EFFORTS_WITHOUT_XHIGH,
         }),
@@ -1742,10 +1879,140 @@ mod tests {
     }
 
     #[test]
+    fn test_map_model_opus_5() {
+        assert_eq!(map_model("claude-opus-5"), Some("claude-opus-5".to_string()));
+        assert_eq!(
+            map_model("claude-opus-5-thinking"),
+            Some("claude-opus-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5"), 1_000_000);
+    }
+
+    #[test]
+    fn test_map_model_opus_5_5() {
+        // 5.5 必须先于 5 命中
+        assert_eq!(
+            map_model("claude-opus-5-5"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5.5"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5-thinking"),
+            Some("claude-opus-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-opus-5-5"), 1_000_000);
+
+        // 回归保护：4.5 不能被 5.5 规则误吃
+        assert_eq!(
+            map_model("claude-opus-4-5"),
+            Some("claude-opus-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-4-5-20251101"),
+            Some("claude-opus-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_map_model_sonnet_5() {
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-thinking"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
+
+        // 回归保护：sonnet-4-5 不能被 sonnet-5 规则误吃
+        assert_eq!(
+            map_model("claude-sonnet-4-5"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-4-5-20250929"),
+            Some("claude-sonnet-4.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_native_reasoning_schema_new_models() {
+        // Opus 5.5 / Opus 5 / Sonnet 5 均应支持 output_config effort，且含 xhigh
+        for m in ["claude-opus-5.5", "claude-opus-5", "claude-sonnet-5"] {
+            let schema = native_reasoning_schema(m)
+                .unwrap_or_else(|| panic!("{m} 应支持 native reasoning schema"));
+            assert!(schema.efforts.contains(&"xhigh"), "{m} 应允许 xhigh");
+        }
+    }
+
+    #[test]
     fn test_map_model_rejects_sonnet_4_8() {
         assert_eq!(map_model("claude-sonnet-4-8"), None);
         assert_eq!(map_model("claude-sonnet-4.8-thinking"), None);
         assert_eq!(get_context_window_size("claude-sonnet-4-8"), 200_000);
+    }
+
+    #[test]
+    fn test_map_model_forward_compatible_future_versions() {
+        // 未来版本（Sonnet 5.5 / Opus 5.6 / Sonnet 6 ...）应免改代码直接可用
+        assert_eq!(
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5.5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-5-5-thinking"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-6"),
+            Some("claude-opus-5.6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-sonnet-6"),
+            Some("claude-sonnet-6".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-6"),
+            Some("claude-opus-6".to_string())
+        );
+
+        // 未来版本同样按规则拿到 1M 上下文与 xhigh 能力
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-sonnet-6"), 1_000_000);
+        assert_eq!(get_context_window_size("claude-opus-6"), 1_000_000);
+        let schema =
+            native_reasoning_schema("claude-sonnet-5.5").expect("future model 应有 reasoning schema");
+        assert!(schema.efforts.contains(&"xhigh"));
+    }
+
+    #[test]
+    fn test_map_model_rejects_legacy_naming_and_unknown_versions() {
+        // Anthropic 旧命名（版本号在家族名之前）不应被误映射
+        assert_eq!(map_model("claude-3-5-sonnet-20241022"), None);
+        assert_eq!(map_model("claude-3-opus-20240229"), None);
+        assert_eq!(map_model("claude-3-5-haiku-20241022"), Some("claude-haiku-4.5".to_string()));
+
+        // 比已实测最新的版本更老的未知版本仍拒绝
+        assert_eq!(map_model("claude-opus-3"), None);
+        assert_eq!(map_model("claude-sonnet-3-5"), None);
+
+        // 已实测版本不受影响
+        assert_eq!(
+            map_model("claude-sonnet-5"),
+            Some("claude-sonnet-5".to_string())
+        );
+        assert_eq!(
+            map_model("claude-opus-5-5"),
+            Some("claude-opus-5.5".to_string())
+        );
     }
 
     #[test]
@@ -1809,6 +2076,7 @@ mod tests {
                 effort: "high".to_string(),
             }),
             metadata: None,
+            safeguards: None,
         }
     }
 
@@ -2042,7 +2310,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
 
@@ -2162,7 +2431,8 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
 
@@ -2219,7 +2489,8 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
         let tools = &result
@@ -2280,7 +2551,8 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
         let tool = &result
@@ -2340,7 +2612,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
         let tool_use = result
@@ -2815,7 +3088,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
         let tool_use = result
@@ -2898,7 +3172,8 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
         let short_name = result.tool_name_map.iter().next().unwrap().0.clone();
@@ -2955,7 +3230,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
 
@@ -3043,7 +3319,8 @@ mod tests {
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
             }),
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
         assert_eq!(
@@ -3071,7 +3348,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
         // 验证生成的是有效的 UUID 格式
@@ -3543,7 +3821,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req);
         assert!(
@@ -3606,7 +3885,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
@@ -3663,7 +3943,8 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
-        };
+                    safeguards: None,
+};
 
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;

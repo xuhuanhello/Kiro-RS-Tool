@@ -394,9 +394,76 @@ async fn main() {
         }
     };
 
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
         tracing::error!("HTTP 服务异常退出: {}", e);
         std::process::exit(1);
+    }
+
+    tracing::info!("服务已正常停止");
+}
+
+/// 优雅关停的绝对上限：极少数情况下在途流可能长期不结束。
+///
+/// 取值参考实测：本机 p99 请求约 96s、最长约 111s（大文件分段写入），
+/// 因此留到 120s，确保正常的长回答不会被切断。
+const SHUTDOWN_MAX_WAIT_SECS: u64 = 120;
+
+/// 等待终止信号（Ctrl+C / SIGTERM），返回后 axum 开始优雅关停
+///
+/// 设计：不设短超时，让在途请求（含正在流式输出的会话）自然结束。为了让关停
+/// 不会看起来像卡住，提供两条逃生口：
+///   1. 再发一次信号（Ctrl+C / SIGTERM）立即退出；
+///   2. 兜底计时器，超过 SHUTDOWN_MAX_WAIT_SECS 强制退出。
+async fn shutdown_signal() {
+    wait_for_stop_signal().await;
+    tracing::info!("收到停止信号，开始优雅关停：等待在途请求结束（再发一次信号可立即退出）…");
+
+    // 逃生口 1：第二次信号立刻退出
+    tokio::spawn(async {
+        wait_for_stop_signal().await;
+        tracing::warn!("收到第二次停止信号，立即退出");
+        std::process::exit(0);
+    });
+
+    // 逃生口 2：绝对上限，避免在途流长期不结束时永远退不出
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_MAX_WAIT_SECS)).await;
+        tracing::warn!("优雅关停等待超过 {}s，强制退出", SHUTDOWN_MAX_WAIT_SECS);
+        std::process::exit(0);
+    });
+}
+
+/// 等待一次停止信号（Ctrl+C 或 SIGTERM）
+async fn wait_for_stop_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!("无法注册 Ctrl+C 处理器: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!("无法注册 SIGTERM 处理器: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
 

@@ -103,6 +103,7 @@
   - [Thinking 模式](#thinking-模式)
   - [工具调用](#工具调用)
 - [模型映射](#模型映射)
+- [Claude Code auto 模式兼容](#claude-code-auto-模式兼容)
 - [Admin（可选）](#admin可选)
 - [手动发布](#手动发布)
 - [注意事项](#注意事项)
@@ -194,17 +195,24 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### Docker
 
-> 推荐生产部署方式。镜像已预编译多架构二进制（linux/amd64、linux/arm64），开箱即用，无需安装 Rust 工具链。
+> 推荐生产部署方式。镜像由 GitHub Actions 自动构建并推送到 GHCR（linux/amd64），开箱即用，无需在服务器上安装 Rust / Node 工具链。
 
 #### 一、最小部署
 
-只需要 `docker-compose.yml` + 一个空的数据目录：
-
 ```bash
-mkdir -p /opt/kiro-rs/data && cd /opt/kiro-rs
-curl -O https://raw.githubusercontent.com/ZyphrZero/kiro.rs/master/docker-compose.yml
+git clone https://github.com/xuhuanhello/Kiro-RS-Tool.git
+cd Kiro-RS-Tool
+mkdir -p data
 docker compose up -d
+sleep 3
+# ⚠️ 关键一步：容器内必须绑 0.0.0.0，否则端口映射失效（应用默认 127.0.0.1）
+sed -i 's/"host": "127.0.0.1"/"host": "0.0.0.0"/' data/config.json
+docker compose restart
 ```
+
+镜像地址：`ghcr.io/xuhuanhello/kiro-rs-tool:latest`（公开，无需 `docker login`）。
+
+> **为什么必须改 host**：应用默认绑定 `127.0.0.1`，而 Docker 的端口发布是转发到容器的 eth0。绑回环会导致 `ports` 映射彻底失效——实测宿主机连接直接失败。容器层面的「仅本机」应该由 `docker-compose.yml` 里 `ports` 左侧的 `KIRO_RS_BIND` 控制（默认 `127.0.0.1`），不要靠应用绑回环实现。
 
 目录结构（首次启动后由容器自动生成 `config.json` / `credentials.json`）：
 
@@ -336,6 +344,10 @@ tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。可选值：`ide`（Kiro IDE）、`cli`（Amazon Q for CLI，适用于 `ksk_` 前缀的 API Key） |
 | `toolCompatibilityMode` | string | `claude-code` | 工具兼容模式。`claude-code` 会将 Claude Code 的 `Write` / `Edit` / `Read` / `Bash` 等工具适配为 Kiro 内置工具；`raw` 直接透传工具 schema，仅建议排障时使用 |
+| `safeguardsEnabled` | boolean | `true` | 支持 Claude Code auto 模式的「服务端分类器审查」（`safeguards` / `safeguard_results` 协议）。开启后，当客户端请求服务端审查时，代理会在**每一个**响应的 `message_delta` 里回传裁决，避免出现「网关不兼容」的分类器计费提示 |
+| `safeguardsClassifierEnabled` | boolean | `false` | 是否用真实模型执行安全判定。**关闭时不下发任何裁决**，每个工具调用仍由 Claude Code 自己的分类器审查（零额外延迟）。开启后仅对 shell 类工具多跑一次模型判定；判定失败或超时一律不下发裁决，交回客户端本地分类 |
+| `safeguardsClassifierModel` | string | `claude-sonnet-5` | 真实分类器使用的模型 |
+| `safeguardsClassifierTimeoutSecs` | number | `20` | 分类器单次判定超时（秒） |
 
 完整配置示例：
 
@@ -366,7 +378,11 @@ tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
    "retryPolicy": null,
    "extractThinking": true,
    "defaultEndpoint": "ide",
-   "toolCompatibilityMode": "claude-code"
+   "toolCompatibilityMode": "claude-code",
+   "safeguardsEnabled": true,
+   "safeguardsClassifierEnabled": false,
+   "safeguardsClassifierModel": "claude-sonnet-5",
+   "safeguardsClassifierTimeoutSecs": 20
 }
 ```
 
@@ -595,27 +611,40 @@ RUST_LOG=debug ./target/release/kiro-rs
         "properties": {
           "city": {"type": "string"}
         },
-        "required": ["city"]
-      }
-    }
-  ],
-  "messages": [...]
-}
-```
-
 ## 模型映射
 
-`map_model` 通过模型名中的关键词匹配（不区分大小写，支持 `4-7` 或 `4.7` 写法），转换为 Kiro 内部模型名：
+`map_model` 采用「实测表 + 向前兼容」策略，把 Anthropic 模型名转换为 Kiro 内部模型名（大小写不敏感，`5-5` / `5.5` / `-thinking` 后缀都支持）：
 
-| Anthropic 模型（关键词） | Kiro 模型 | 上下文窗口 |
+| Anthropic 模型 | Kiro 模型 | 上下文窗口 |
 |---|---|---|
-| `*sonnet*` 含 `4-6` / `4.6` | `claude-sonnet-4.6` | **1M** |
-| `*sonnet*`（其他，默认） | `claude-sonnet-4.5` | 200K |
-| `*opus*` 含 `4-8` / `4.8` | `claude-opus-4.8` | **1M** |
-| `*opus*` 含 `4-7` / `4.7` | `claude-opus-4.7` | **1M** |
-| `*opus*` 含 `4-6` / `4.6` | `claude-opus-4.6` | **1M** |
-| `*opus*` 含 `4-5` / `4.5` | `claude-opus-4.5` | 200K |
-| `*haiku*` | `claude-haiku-4.5` | 200K |
+| `claude-opus-5-5` / `claude-opus-5.5` | `claude-opus-5.5` | **1M** |
+| `claude-opus-5` | `claude-opus-5` | **1M** |
+| `claude-sonnet-5` | `claude-sonnet-5` | **1M** |
+| `claude-opus-4-8` / `4.8` | `claude-opus-4.8` | **1M** |
+| `claude-opus-4-7` / `4.7` | `claude-opus-4.7` | **1M** |
+| `claude-opus-4-6` / `4.6` | `claude-opus-4.6` | **1M** |
+| `claude-sonnet-4-6` / `4.6` | `claude-sonnet-4.6` | **1M** |
+| `claude-opus-4-5` / `4.5` | `claude-opus-4.5` | 200K |
+| `claude-sonnet-4-5` / `4.5` | `claude-sonnet-4.5` | 200K |
+| `claude-haiku-*` | `claude-haiku-4.5` | 200K |
+
+**向前兼容**：比上表某个家族最新版本更新的版本会按 Kiro 命名规则自动推导。例如 Kiro 将来上线 Sonnet 5.5，直接 `--model claude-sonnet-5-5` 即可调用，**无需改代码**（但不会自动出现在 `/v1/models` 列表里）。更老或已知不存在的版本（如 `claude-sonnet-4-8`）仍在本地拒绝，避免把无效模型名透传到上游换回一条更难读的错误。
+
+**上下文窗口规则**：Opus / Sonnet 自 4.6 起按 1M 处理，更早版本与 Haiku 为 200K。本服务按该窗口计算 `contextUsageEvent` 的实际 `input_tokens`，客户端发起大 `max_tokens` 请求时无需额外配置。
+
+> **thinking / effort**
+>
+> 模型名带 `-thinking` 后缀（如 `claude-opus-5-5-thinking`）会自动覆写 `thinking` 配置：
+>
+> - Opus 5.5 / 5 / 4.8 / 4.7：`adaptive` 模式，effort 支持 `low` / `medium` / `high` / `xhigh` / `max`
+> - Opus 4.6 / Sonnet 4.6：`adaptive` 模式，effort 支持 `low` / `medium` / `high` / `max`（无 `xhigh`）
+> - 更早模型：`enabled` 模式，`budget_tokens` 固定 20000
+>
+> 未设置 effort 时按 `high` 处理；若指定了该模型不支持的档位（例如给 Opus 4.6 传 `xhigh`），回落到该模型允许的最高档 `max`。CLI endpoint 保持抓包验证过的最小 `output_config` 形态；IDE endpoint 按 IDE bundle 行为补充 `thinking={type:"adaptive",display:"summarized"}` wrapper。流式与非流式响应均支持 Kiro 的 `reasoningContentEvent`，会转换为 Anthropic `thinking` 内容块并优先使用上游 signature。
+>
+> **Opus 5.5 的差异**：其 `thinking.type` 枚举只有 `adaptive`，**不支持 `disabled`**（Opus 5 / Sonnet 5 / Opus 4.8 都是 `adaptive` + `disabled`）。本服务在客户端关闭 thinking 时是整体省略该字段，因此天然满足该约束。
+
+可用模型完整列表通过 `GET /v1/models` 查询。
 
 > **1M 上下文支持**：Opus 4.8 / 4.7 / 4.6 按 1M 上下文窗口处理。
 >
@@ -624,6 +653,30 @@ RUST_LOG=debug ./target/release/kiro-rs
 > 模型名带 `-thinking` 后缀（如 `claude-opus-4-8-thinking`）会自动覆写 `thinking` 配置：Opus 4.6 / 4.7 / 4.8 走 `adaptive` 模式，其他模型走 `enabled` 模式，`budget_tokens` 固定 20000。Kiro CLI 2.6.0 的模型 schema 已验证支持 `low` / `medium` / `high` / `xhigh` / `max` 五档 effort；本服务会在 Opus 4.6 / 4.7 / 4.8 adaptive 路径发送 `additionalModelRequestFields.output_config.effort`，未设置时默认 `high`，非法值回落到 `high`。CLI endpoint 会保持抓包验证过的最小 `output_config` 形态；IDE endpoint 会按 IDE bundle 行为补充 `thinking={type:"adaptive",display:"summarized"}` wrapper。也兼容 `claude-opus-4-8-thinking-xhigh` / `-max` 这类后缀写法。流式和非流式响应均支持 Kiro 新的 `reasoningContentEvent`，会转换为 Anthropic `thinking` 内容块并优先使用上游 signature。
 
 可用模型完整列表通过 `GET /v1/models` 查询。
+
+## Claude Code auto 模式兼容
+
+Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请求体带 `safeguards` 字段，并要求服务端在**每一个**响应的 `message_delta` 里回传 `safeguard_results`。只要有一个响应漏掉，Claude Code 就会判定网关不兼容、回退到自己的本地分类器，并展示一条「分类器计费」提示。
+
+本服务实现了该协议：
+
+| 配置 | 行为 |
+|---|---|
+| `safeguardsEnabled: true`（默认） | 客户端请求审查时，每个响应都回传裁决，上述提示不再出现 |
+| `safeguardsClassifierEnabled: false`（默认） | 不下发任何裁决 → 每个工具调用仍由 Claude Code 自己的分类器审查，**零额外延迟** |
+| `safeguardsClassifierEnabled: true` | 对 shell 类工具（`Bash` / `shell` / `terminal` / `exec`）多跑一次模型判定，每个含此类调用的响应约 +1~3s |
+
+**裁决的三态语义**（实测确认）：
+
+- 判定为安全 → `not_flagged`：客户端直接放行，**不再重复检查**
+- 判定为危险 → `flagged`：客户端拦截该动作，并把理由透传给模型
+- **分类失败 / 超时 / 未覆盖 → 不下发裁决**：客户端回退到自己的分类器（不会无条件放行）
+
+服务端**绝不会**在未真正分类的情况下下发 `not_flagged`——那等于让客户端跳过它自己的安全检查，是安全倒退而非优化。
+
+> **替代方案**：如果不需要服务端裁决，也可以在 Claude Code 侧关闭该请求——在
+> `~/.claude/settings.json` 的 `env` 里设置 `CLAUDE_CODE_AUTO_MODE_SERVER=0`。
+> 客户端不再请求审查，提示同样不出现，且零额外延迟；代价是服务端的分类器不会生效。
 
 ## Admin（可选）
 

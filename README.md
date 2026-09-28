@@ -664,7 +664,11 @@ Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请�
 |---|---|
 | `safeguardsEnabled: true`（默认） | 客户端请求审查时，每个响应都回传裁决，上述提示不再出现 |
 | `safeguardsClassifierEnabled: false`（默认） | 不下发任何裁决 → 每个工具调用仍由 Claude Code 自己的分类器审查，**零额外延迟** |
-| `safeguardsClassifierEnabled: true` | 对 shell 类工具（`Bash` / `shell` / `terminal` / `exec`）多跑一次模型判定，每个含此类调用的响应约 +1~3s |
+| `safeguardsClassifierEnabled: true` | 会**改变实际后果**的工具多跑一次模型判定，每个含此类调用的响应约 +1~3s |
+
+**服务端分类覆盖哪些工具**：命令执行（`Bash` / `*shell*` / `*terminal*` / `*exec*`）、文件写入与编辑（`Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `mcp__*__write_file`）、网络读写（`*fetch*` / `*http*` / `*upload*` / `*download*`）。
+
+未覆盖的（`Read` / `Grep` / `Glob` / `TodoWrite` 等没有破坏性效果的工具）一律以 `skipped` 表达，交回客户端自己的分类器——多跑一次判定只是白白增加延迟。
 
 **裁决的三态语义**（实测确认）：
 

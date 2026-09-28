@@ -1135,12 +1135,16 @@ fn create_sse_stream(
                             // 流结束：先按需跑真实分类器，再生成最终事件。
                             // 分类失败时保留先前写入的空裁决表，客户端会回退到
                             // 自己的分类器——绝不会因此放行任何未经审查的动作。
-                            if let super::safeguards::SafeguardsPlan::Classify(settings) = &safeguards
+                            if let super::safeguards::SafeguardsPlan::Classify {
+                                settings,
+                                context,
+                            } = &safeguards
                                 && !ctx.collected_tool_uses.is_empty()
                             {
                                 let verdicts = super::safeguards::classify(
                                     &provider,
                                     settings,
+                                    context,
                                     &ctx.collected_tool_uses,
                                 )
                                 .await;

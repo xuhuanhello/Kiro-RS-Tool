@@ -747,7 +747,7 @@ async fn build_safeguard_results(
     match safeguards {
         SafeguardsPlan::Off => None,
         SafeguardsPlan::Deferred => Some(super::safeguards::deferred_results()),
-        SafeguardsPlan::Classify(settings) => {
+        SafeguardsPlan::Classify { settings, context } => {
             let tool_uses: Vec<(String, String, Value)> = content
                 .iter()
                 .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
@@ -764,7 +764,8 @@ async fn build_safeguard_results(
                 return Some(super::safeguards::deferred_results());
             }
 
-            let verdicts = super::safeguards::classify(provider, settings, &tool_uses).await;
+            let verdicts =
+                super::safeguards::classify(provider, settings, context, &tool_uses).await;
             if verdicts.is_empty() {
                 Some(super::safeguards::deferred_results())
             } else {

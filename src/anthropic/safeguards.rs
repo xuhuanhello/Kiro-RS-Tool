@@ -29,6 +29,180 @@ pub fn requested(req: &MessagesRequest) -> bool {
     req.safeguards.as_ref().is_some_and(|v| !v.is_null())
 }
 
+// ===== 客户端上下文（classifier_context）=====
+
+/// 客户端随请求发来的分类上下文（Claude Code 的 classifier_context）
+///
+/// 这是**判定准确性的关键输入**。没有它，分类器只能看到一条裸命令，判断
+/// 「这个路径在不在项目内」完全靠猜；有了 live_cwd 与可信目录，这一步就从
+/// 猜测变成了事实——例如删除 /tmp 下的临时产物时，模型能确认它既不在项目内、
+/// 也不属于用户数据。
+///
+/// 字段全部可选：客户端版本不同、或字段被截断时，缺失的部分按未知处理，
+/// 分类器仍按原有规则判定。
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ClassifierContext {
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
+    pub live_cwd: Option<String>,
+    #[serde(default)]
+    pub home_dir: Option<String>,
+    #[serde(default)]
+    pub trusted_directories: Option<TrustedDirectories>,
+    #[serde(default)]
+    pub rules: Option<Rules>,
+    #[serde(default)]
+    pub auto_mode: Option<AutoMode>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TrustedDirectories {
+    #[serde(default)]
+    pub primary: Option<TrustedPath>,
+    #[serde(default)]
+    pub additional: Vec<TrustedPath>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct TrustedPath {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub resolved: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Rules {
+    #[serde(default)]
+    pub allow: Vec<Rule>,
+    #[serde(default)]
+    pub deny: Vec<Rule>,
+    #[serde(default)]
+    pub ask: Vec<Rule>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Rule {
+    #[serde(default)]
+    pub rule: Option<String>,
+    #[serde(default)]
+    pub canonical: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AutoMode {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub soft_deny: Vec<String>,
+    #[serde(default)]
+    pub hard_deny: Vec<String>,
+}
+
+/// 渲染上下文时的条数上限，避免规则很多时把提示词撑爆
+const MAX_CONTEXT_ITEMS: usize = 12;
+
+/// 从请求里取出 classifier_context（取不到时返回全空的默认值）
+pub fn extract_context(req: &MessagesRequest) -> ClassifierContext {
+    req.safeguards
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .find_map(|entry| entry.get("classifier_context"))
+        })
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+        .unwrap_or_default()
+}
+
+impl ClassifierContext {
+    /// 渲染成给分类器看的紧凑文本块
+    pub fn render(&self) -> String {
+        let mut out: Vec<String> = Vec::new();
+
+        if let Some(v) = &self.live_cwd {
+            out.push(format!("working directory (project root): {v}"));
+        }
+        if let Some(v) = &self.home_dir {
+            out.push(format!("home directory: {v}"));
+        }
+        if let Some(v) = &self.platform {
+            out.push(format!("platform: {v}"));
+        }
+        if let Some(v) = &self.permission_mode {
+            out.push(format!("permission mode: {v}"));
+        }
+
+        if let Some(td) = &self.trusted_directories {
+            let mut dirs: Vec<String> = Vec::new();
+            if let Some(p) = &td.primary
+                && let Some(path) = &p.path
+            {
+                dirs.push(path.clone());
+                dirs.extend(p.resolved.iter().take(MAX_CONTEXT_ITEMS).cloned());
+            }
+            for a in td.additional.iter().take(MAX_CONTEXT_ITEMS) {
+                if let Some(path) = &a.path {
+                    dirs.push(path.clone());
+                }
+            }
+            dirs.dedup();
+            if !dirs.is_empty() {
+                out.push(format!("user-trusted directories: {}", dirs.join(", ")));
+            }
+        }
+
+        if let Some(r) = &self.rules {
+            let fmt = |rs: &[Rule]| -> String {
+                rs.iter()
+                    .take(MAX_CONTEXT_ITEMS)
+                    .filter_map(|x| x.canonical.clone().or_else(|| x.rule.clone()))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let allow = fmt(&r.allow);
+            let deny = fmt(&r.deny);
+            if !allow.is_empty() {
+                out.push(format!("user allow rules: {allow}"));
+            }
+            if !deny.is_empty() {
+                out.push(format!("user deny rules: {deny}"));
+            }
+            let ask = fmt(&r.ask);
+            if !ask.is_empty() {
+                out.push(format!("user ask rules (require confirmation): {ask}"));
+            }
+        }
+
+        if let Some(am) = &self.auto_mode {
+            let join = |v: &Vec<String>| -> String {
+                v.iter()
+                    .take(MAX_CONTEXT_ITEMS)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let hard = join(&am.hard_deny);
+            let soft = join(&am.soft_deny);
+            let allow = join(&am.allow);
+            if !hard.is_empty() {
+                out.push(format!("auto-mode hard-deny rules: {hard}"));
+            }
+            if !soft.is_empty() {
+                out.push(format!("auto-mode soft-deny rules: {soft}"));
+            }
+            if !allow.is_empty() {
+                out.push(format!("auto-mode allow rules: {allow}"));
+            }
+        }
+
+        out.join("\n")
+    }
+}
+
 /// 单个工具的裁决
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Evaluated 供后续接入真实分类器的阶段使用
@@ -115,8 +289,11 @@ pub enum SafeguardsPlan {
     Off,
     /// 只回传空结果：所有裁决交回客户端自己的分类器（零安全风险）
     Deferred,
-    /// 用指定模型做真实分类
-    Classify(ClassifierSettings),
+    /// 用指定模型做真实分类（携带客户端发来的分类上下文）
+    Classify {
+        settings: ClassifierSettings,
+        context: ClassifierContext,
+    },
 }
 
 /// 依据配置与请求构造本次请求的 safeguards 计划
@@ -129,7 +306,11 @@ pub fn plan_for(
         return SafeguardsPlan::Off;
     }
     match classifier {
-        Some(c) => SafeguardsPlan::Classify(c.clone()),
+        Some(c) => SafeguardsPlan::Classify {
+            settings: c.clone(),
+            // 客户端上下文只在真正要分类时才有用（含 cwd / 可信目录 / 规则）
+            context: extract_context(req),
+        },
         None => SafeguardsPlan::Deferred,
     }
 }
@@ -169,6 +350,13 @@ Do NOT flag as routine development work:
   * user-level package and tool caches under the XDG cache directory (~/.cache/...)
   * scratch, benchmark or log files the agent itself created during this session
 
+When a "Session context" block is present it comes from the client and is authoritative
+for locating the work. Use the working directory and user-trusted directories to decide
+whether a path counts as "inside the project". Treat user deny rules and auto-mode
+hard-deny rules as authoritative blocks. Allow rules describe user intent but do not by
+themselves make a destructive call safe: if an allow rule and a destructive target
+disagree, judge the target on its own merits.
+
 Err on the side of blocking when you are unsure.
 
 Reply with ONLY a JSON object and nothing else:
@@ -184,6 +372,7 @@ Include exactly one entry for every tool call you were given, reusing its id."#;
 pub async fn classify(
     provider: &Arc<KiroProvider>,
     settings: &ClassifierSettings,
+    context: &ClassifierContext,
     tool_uses: &[(String, String, Value)],
 ) -> std::collections::HashMap<String, ToolVerdict> {
     let targets: Vec<&(String, String, Value)> = tool_uses
@@ -195,17 +384,23 @@ pub async fn classify(
         return std::collections::HashMap::new();
     }
 
-    match run_classifier(provider, settings, &targets).await {
+    match run_classifier(provider, settings, context, &targets).await {
         Ok(verdicts) => {
             let flagged: Vec<&str> = verdicts
                 .iter()
                 .filter(|(_, v)| matches!(v, ToolVerdict::Evaluated { flagged: true, .. }))
                 .map(|(id, _)| id.as_str())
                 .collect();
+            let ctx_note = if context.render().is_empty() {
+                "无（客户端未提供，只能按字面路径判断）".to_string()
+            } else {
+                format!("cwd={}", context.live_cwd.as_deref().unwrap_or("未知"))
+            };
             tracing::info!(
-                "safeguards 分类器: 已判定 {} 个 shell 类工具，flagged={:?}（未覆盖的由客户端本地分类兜底）",
+                "safeguards 分类器: 已判定 {} 个 shell 类工具，flagged={:?}，客户端上下文 {}（未覆盖的由客户端本地分类兜底）",
                 verdicts.len(),
-                flagged
+                flagged,
+                ctx_note
             );
             verdicts
         }
@@ -222,9 +417,10 @@ pub async fn classify(
 async fn run_classifier(
     provider: &Arc<KiroProvider>,
     settings: &ClassifierSettings,
+    context: &ClassifierContext,
     targets: &[&(String, String, Value)],
 ) -> anyhow::Result<std::collections::HashMap<String, ToolVerdict>> {
-    let req = build_classifier_request(settings, targets);
+    let req = build_classifier_request(settings, context, targets);
     let conv = convert_request_with_mode(&req, ToolCompatibilityMode::Raw)
         .map_err(|e| anyhow::anyhow!("分类器请求转换失败: {}", e))?;
     let body = serde_json::to_string(&KiroRequest {
@@ -247,16 +443,24 @@ async fn run_classifier(
 
 fn build_classifier_request(
     settings: &ClassifierSettings,
+    context: &ClassifierContext,
     targets: &[&(String, String, Value)],
 ) -> MessagesRequest {
     let calls: Vec<Value> = targets
         .iter()
         .map(|(id, name, input)| serde_json::json!({"id": id, "name": name, "input": input}))
         .collect();
-    let user = format!(
-        "Tool calls to classify:\n{}",
-        serde_json::to_string_pretty(&calls).unwrap_or_else(|_| "[]".to_string())
-    );
+    let calls_text = serde_json::to_string_pretty(&calls).unwrap_or_else(|_| "[]".to_string());
+
+    // 把客户端上下文放在工具调用之前：判定"是否在项目内"依赖它
+    let rendered = context.render();
+    let user = if rendered.is_empty() {
+        format!("Tool calls to classify:\n{calls_text}")
+    } else {
+        format!(
+            "Session context (supplied by the client):\n{rendered}\n\n             Tool calls to classify:\n{calls_text}"
+        )
+    };
 
     MessagesRequest {
         model: settings.model.clone(),
@@ -496,8 +700,115 @@ done"#;
         // 请求要求且有分类器 -> Classify
         assert!(matches!(
             plan_for(true, Some(&settings), &req),
-            SafeguardsPlan::Classify(_)
+            SafeguardsPlan::Classify { .. }
         ));
+    }
+
+#[test]
+    fn extract_context_reads_client_shape() {
+        // 形状取自 Claude Code 2.1.283 bundle 里的 classifier_context schema
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{
+              "model":"claude-sonnet-5","max_tokens":16,
+              "messages":[{"role":"user","content":"hi"}],
+              "safeguards":[{"type":"dangerous_tool_use","classifier_context":{
+                "permission_mode":"auto","platform":"darwin",
+                "live_cwd":"/Users/me/proj","home_dir":"/Users/me",
+                "trusted_directories":{
+                  "primary":{"path":"/Users/me/proj","resolved":["/Users/me/proj"]},
+                  "additional":[{"path":"/tmp","resolved":["/private/tmp"]}]},
+                "rules":{"allow":[{"rule":"Bash(ls:*)","canonical":"ls"}],
+                         "deny":[{"rule":"Bash(curl:*)"}],"ask":[]},
+                "auto_mode":{"allow":[],"soft_deny":["rm -rf /"],"hard_deny":[]}
+              }}]
+            }"#,
+        )
+        .unwrap();
+
+        let ctx = extract_context(&req);
+        assert_eq!(ctx.live_cwd.as_deref(), Some("/Users/me/proj"));
+        assert_eq!(ctx.platform.as_deref(), Some("darwin"));
+
+        let out = ctx.render();
+        assert!(
+            out.contains("working directory (project root): /Users/me/proj"),
+            "必须能看出项目根：{out}"
+        );
+        assert!(out.contains("/tmp"), "可信目录要带上：{out}");
+        assert!(out.contains("user deny rules"), "拒绝规则要带上：{out}");
+        assert!(out.contains("auto-mode soft-deny"), "auto 模式规则要带上：{out}");
+    }
+
+    #[test]
+    fn extract_context_without_safeguards_is_empty() {
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .unwrap();
+        let ctx = extract_context(&req);
+        assert!(ctx.render().is_empty());
+        assert!(ctx.live_cwd.is_none());
+    }
+
+    #[test]
+    fn extract_context_tolerates_partial_and_unknown_fields() {
+        // 客户端版本不同、字段缺失或出现未知字段时不应 panic，也不应丢掉已知字段
+        let req: MessagesRequest = serde_json::from_str(
+            r#"{
+              "model":"claude-sonnet-5","max_tokens":16,
+              "messages":[{"role":"user","content":"hi"}],
+              "safeguards":[{"type":"dangerous_tool_use","classifier_context":{
+                "live_cwd":"/w","future_field":{"nested":[1,2,3]}
+              }}]
+            }"#,
+        )
+        .unwrap();
+
+        let ctx = extract_context(&req);
+        assert_eq!(ctx.live_cwd.as_deref(), Some("/w"), "已知字段不能被未知字段带崩");
+        assert!(ctx.home_dir.is_none());
+        let out = ctx.render();
+        assert!(out.contains("/w"));
+        assert!(!out.contains("home directory"), "缺失字段不应出现在渲染结果里");
+    }
+
+    #[test]
+    fn classifier_request_embeds_context_before_tool_calls() {
+        let settings = ClassifierSettings {
+            model: "claude-sonnet-5".to_string(),
+            timeout: std::time::Duration::from_secs(20),
+        };
+        let call = (
+            "toolu_1".to_string(),
+            "Bash".to_string(),
+            serde_json::json!({"command":"rm -rf /tmp/bench"}),
+        );
+        let targets: Vec<&(String, String, Value)> = vec![&call];
+
+        let no_ctx = ClassifierContext::default();
+        let req = build_classifier_request(&settings, &no_ctx, &targets);
+        let user = match &req.messages[0].content {
+            Value::String(s) => s.clone(),
+            other => panic!("期望字符串内容，实际 {other:?}"),
+        };
+        assert!(!user.contains("Session context"), "无上下文时不应出现该块");
+        assert!(user.contains("Tool calls to classify:"));
+
+        let ctx = ClassifierContext {
+            live_cwd: Some("/Users/me/proj".to_string()),
+            ..Default::default()
+        };
+        let req = build_classifier_request(&settings, &ctx, &targets);
+        let user = match &req.messages[0].content {
+            Value::String(s) => s.clone(),
+            other => panic!("期望字符串内容，实际 {other:?}"),
+        };
+        assert!(user.contains("Session context"));
+        assert!(user.contains("/Users/me/proj"), "cwd 必须进入提示词");
+        // 上下文必须排在工具调用之前，模型先建立环境再判定
+        let ctx_pos = user.find("Session context").unwrap();
+        let call_pos = user.find("Tool calls to classify:").unwrap();
+        assert!(ctx_pos < call_pos);
     }
 
     #[test]

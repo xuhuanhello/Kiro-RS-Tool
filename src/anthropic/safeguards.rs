@@ -475,6 +475,138 @@ Reply with ONLY a JSON object and nothing else:
 {"verdicts":[{"id":"<tool_use_id>","flagged":true,"reason":"one short sentence"}]}
 Include exactly one entry for every tool call you were given, reusing its id."#;
 
+// ===== 分类结果缓存 =====
+
+/// 缓存容量上限（条）
+const CACHE_CAP: usize = 512;
+
+/// 缓存有效期
+///
+/// 安全判定不适合长期复用：用户改了规则、换了项目之后，旧裁决应当失效。
+/// 键里已经带上 cwd 与用户规则，TTL 是最后一道兜底。
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+struct CacheEntry {
+    verdict: ToolVerdict,
+    at: std::time::Instant,
+}
+
+/// 分类结果缓存（LRU + TTL）
+///
+/// agent 在会话里会反复跑同样的命令（ls / cargo test / git status）。同一份
+/// 「工具 + 输入 + 工作目录 + 用户拒绝规则」的判定可以直接复用，省掉每次
+/// 1~3s 的模型调用。
+///
+/// **只缓存放行，不缓存拒绝**：拒绝的判定依赖会话活动摘要（例如目标是不是
+/// agent 自己刚建的），缓存下来会把一次误判固化成永久拦截。放行则不存在这个
+/// 问题——同一份输入既然判过安全，再判一次还是安全。
+struct ClassificationCache {
+    map: std::collections::HashMap<String, CacheEntry>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl ClassificationCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &str) -> Option<ToolVerdict> {
+        let fresh = self
+            .map
+            .get(key)
+            .filter(|e| e.at.elapsed() < CACHE_TTL)
+            .map(|e| e.verdict.clone());
+
+        let Some(verdict) = fresh else {
+            // 过期条目直接移除，不占容量
+            if self.map.remove(key).is_some() {
+                self.order.retain(|k| k != key);
+            }
+            return None;
+        };
+
+        // LRU：命中的键移到队尾
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_string());
+        Some(verdict)
+    }
+
+    fn put(&mut self, key: String, verdict: ToolVerdict) {
+        if self.map.contains_key(&key) {
+            self.order.retain(|k| k != &key);
+        } else {
+            while self.order.len() >= CACHE_CAP {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.map.remove(&oldest);
+            }
+        }
+        self.map.insert(
+            key.clone(),
+            CacheEntry {
+                verdict,
+                at: std::time::Instant::now(),
+            },
+        );
+        self.order.push_back(key);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+static CLASSIFICATION_CACHE: std::sync::OnceLock<parking_lot::Mutex<ClassificationCache>> =
+    std::sync::OnceLock::new();
+
+fn classification_cache() -> &'static parking_lot::Mutex<ClassificationCache> {
+    CLASSIFICATION_CACHE.get_or_init(|| parking_lot::Mutex::new(ClassificationCache::new()))
+}
+
+/// 该裁决是否允许进入缓存
+///
+/// 只有「放行」可以缓存：拒绝的判定依赖会话活动摘要（目标是不是 agent 自己
+/// 刚建的），缓存下来会把一次误判固化成永久拦截。放行没有这个问题——同一份
+/// 输入既然判过安全，再判一次还是安全。
+fn cacheable(verdict: &ToolVerdict) -> bool {
+    matches!(verdict, ToolVerdict::Evaluated { flagged: false, .. })
+}
+
+/// 缓存键：工具名 + 输入 + 工作目录 + 用户拒绝规则
+///
+/// 带上工作目录与拒绝规则，是为了让「换了项目」或「用户刚加了拒绝规则」这类
+/// 变化自然失效，而不是只靠 TTL 兜底。
+fn cache_key(name: &str, input: &Value, context: &ClassifierContext) -> String {
+    let mut key = String::with_capacity(160);
+    key.push_str(name);
+    key.push('\u{1}');
+    key.push_str(&serde_json::to_string(input).unwrap_or_default());
+    key.push('\u{1}');
+    key.push_str(context.live_cwd.as_deref().unwrap_or(""));
+
+    // 拒绝与需确认规则属于否决性配置：变了就必须重新判定
+    if let Some(r) = &context.rules {
+        for rule in r.deny.iter().chain(r.ask.iter()) {
+            if let Some(s) = rule.canonical.as_deref().or(rule.rule.as_deref()) {
+                key.push('\u{2}');
+                key.push_str(s);
+            }
+        }
+    }
+    if let Some(am) = &context.auto_mode {
+        for rule in &am.hard_deny {
+            key.push('\u{2}');
+            key.push_str(rule);
+        }
+    }
+    key
+}
+
 /// 对给定的工具调用跑一次真实安全分类。
 ///
 /// 只返回**确实评估过**的工具裁决。任何失败（请求构建、调用、超时、输出无法
@@ -496,34 +628,69 @@ pub async fn classify(
         return std::collections::HashMap::new();
     }
 
-    match run_classifier(provider, settings, context, &targets).await {
-        Ok(verdicts) => {
-            let flagged: Vec<&str> = verdicts
-                .iter()
-                .filter(|(_, v)| matches!(v, ToolVerdict::Evaluated { flagged: true, .. }))
-                .map(|(id, _)| id.as_str())
-                .collect();
-            let ctx_note = if context.render().is_empty() {
-                "无（客户端未提供，只能按字面路径判断）".to_string()
-            } else {
-                format!("cwd={}", context.live_cwd.as_deref().unwrap_or("未知"))
-            };
-            tracing::info!(
-                "safeguards 分类器: 已判定 {} 个 shell 类工具，flagged={:?}，客户端上下文 {}（未覆盖的由客户端本地分类兜底）",
-                verdicts.len(),
-                flagged,
-                ctx_note
-            );
-            verdicts
-        }
-        Err(e) => {
-            tracing::warn!(
-                "safeguards 分类器未产出裁决（本次交回客户端本地分类）: {}",
-                e
-            );
-            std::collections::HashMap::new()
+    use std::collections::HashMap;
+
+    // 1) 先查缓存（锁在 await 之前释放）
+    let mut verdicts: HashMap<String, ToolVerdict> = HashMap::new();
+    let mut misses: Vec<&(String, String, Value)> = Vec::new();
+    {
+        let mut cache = classification_cache().lock();
+        for t in &targets {
+            match cache.get(&cache_key(&t.1, &t.2, context)) {
+                Some(v) => {
+                    verdicts.insert(t.0.clone(), v);
+                }
+                None => misses.push(t),
+            }
         }
     }
+    let hits = verdicts.len();
+
+    // 2) 只对未命中的跑模型
+    if !misses.is_empty() {
+        match run_classifier(provider, settings, context, &misses).await {
+            Ok(fresh) => {
+                let mut cache = classification_cache().lock();
+                for (id, v) in &fresh {
+                    verdicts.insert(id.clone(), v.clone());
+                    // 只缓存放行；拒绝不缓存（见 ClassificationCache 的说明）
+                    if cacheable(v)
+                        && let Some(t) = targets.iter().find(|t| &t.0 == id)
+                    {
+                        cache.put(cache_key(&t.1, &t.2, context), v.clone());
+                    }
+                }
+            }
+            Err(e) => {
+                // 分类失败：已命中的缓存裁决仍然有效，未命中的交回客户端
+                tracing::warn!(
+                    "safeguards 分类器未产出裁决（本次交回客户端本地分类）: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    let flagged: Vec<&str> = verdicts
+        .iter()
+        .filter(|(_, v)| matches!(v, ToolVerdict::Evaluated { flagged: true, .. }))
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let ctx_note = if context.render().is_empty() {
+        "无（客户端未提供，只能按字面路径判断）".to_string()
+    } else {
+        format!("cwd={}", context.live_cwd.as_deref().unwrap_or("未知"))
+    };
+    tracing::info!(
+        "safeguards 分类器: 判定 {} 个工具（缓存命中 {}，新判定 {}），flagged={:?}，客户端上下文 {}",
+        verdicts.len(),
+        hits,
+        misses.len(),
+        flagged,
+        ctx_note
+    );
+
+    verdicts
 }
 
 async fn run_classifier(
@@ -1058,6 +1225,101 @@ done"#;
         let act = user.find("recent tool calls").unwrap();
         let calls = user.find("Tool calls to classify:").unwrap();
         assert!(act < calls, "活动摘要应排在待判定调用之前");
+    }
+
+#[test]
+    fn cache_stores_and_returns_verdict() {
+        let mut c = ClassificationCache::new();
+        c.put(
+            "k".to_string(),
+            ToolVerdict::Evaluated {
+                flagged: false,
+                explanation: "ok".to_string(),
+            },
+        );
+        assert!(c.get("k").is_some(), "写入后应命中");
+        assert!(c.get("missing").is_none(), "未写入的键不应命中");
+    }
+
+    #[test]
+    fn cache_evicts_oldest_at_capacity() {
+        let mut c = ClassificationCache::new();
+        for i in 0..CACHE_CAP + 5 {
+            c.put(format!("k{i}"), ToolVerdict::Skipped);
+        }
+        assert!(c.len() <= CACHE_CAP, "容量必须有上限，实际 {}", c.len());
+        assert!(c.get("k0").is_none(), "最旧的条目应被淘汰");
+        assert!(
+            c.get(&format!("k{}", CACHE_CAP + 4)).is_some(),
+            "最新的条目应保留"
+        );
+    }
+
+    #[test]
+    fn cache_hit_refreshes_lru_order() {
+        let mut c = ClassificationCache::new();
+        c.put("a".to_string(), ToolVerdict::Skipped);
+        c.put("b".to_string(), ToolVerdict::Skipped);
+        let _ = c.get("a"); // a 变为最近使用
+        for i in 0..CACHE_CAP - 1 {
+            c.put(format!("x{i}"), ToolVerdict::Skipped);
+        }
+        assert!(c.get("a").is_some(), "命中过的条目不应先被淘汰");
+        assert!(c.get("b").is_none(), "未命中的最旧条目应先被淘汰");
+    }
+
+    #[test]
+    fn cache_key_separates_contexts() {
+        let input = serde_json::json!({"command":"rm -rf build"});
+        let a = ClassifierContext {
+            live_cwd: Some("/p1".to_string()),
+            ..Default::default()
+        };
+        let b = ClassifierContext {
+            live_cwd: Some("/p2".to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            cache_key("Bash", &input, &a),
+            cache_key("Bash", &input, &b),
+            "不同工作目录不能共用缓存"
+        );
+        assert_ne!(
+            cache_key("Bash", &input, &a),
+            cache_key("Bash", &serde_json::json!({"command":"ls"}), &a),
+            "不同输入不能共用缓存"
+        );
+
+        // 用户新增拒绝规则后，旧裁决必须失效
+        let mut with_deny = a.clone();
+        with_deny.rules = Some(Rules {
+            deny: vec![Rule {
+                rule: Some("Bash(rm:*)".to_string()),
+                canonical: None,
+            }],
+            ..Default::default()
+        });
+        assert_ne!(
+            cache_key("Bash", &input, &a),
+            cache_key("Bash", &input, &with_deny),
+            "新增拒绝规则后必须重新判定"
+        );
+    }
+
+    #[test]
+    fn only_allow_verdicts_are_cacheable() {
+        assert!(cacheable(&ToolVerdict::Evaluated {
+            flagged: false,
+            explanation: "ok".to_string(),
+        }));
+        assert!(
+            !cacheable(&ToolVerdict::Evaluated {
+                flagged: true,
+                explanation: "no".to_string(),
+            }),
+            "拒绝判定依赖会话活动摘要，缓存会把误判固化成永久拦截"
+        );
+        assert!(!cacheable(&ToolVerdict::Skipped));
     }
 
     #[test]

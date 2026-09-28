@@ -9,6 +9,11 @@
 #   echo <PAT> | docker login ghcr.io -u xuhuanhello --password-stdin
 # 或在 GitHub 的 Packages 设置里把该包改为 public。
 #
+# ⚠️ 容器内必须把 config.json 的 host 设为 0.0.0.0
+#    应用默认绑定 127.0.0.1，而 Docker 端口发布是转发到容器的 eth0，
+#    绑回环会导致下面 ports 映射完全失效（宿主机连不上）。
+#    容器里"仅本机"由 ports 左侧的 KIRO_RS_BIND 控制，不靠应用绑回环。
+#
 # 环境变量：
 #   KIRO_RS_IMAGE  覆盖镜像地址（例如用本地构建的 kiro-rs:fork）
 #   KIRO_RS_BIND   监听地址，默认 127.0.0.1（仅本机）。

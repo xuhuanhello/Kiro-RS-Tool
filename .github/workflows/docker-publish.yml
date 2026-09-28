@@ -1,8 +1,12 @@
 name: Build and publish Docker image
 
-# 构建多架构镜像并推送到 GHCR。
+# 构建镜像并推送到 GHCR。
 # 使用内置 GITHUB_TOKEN（自带 packages:write），无需本地 docker login 凭据。
 # 产物：ghcr.io/<owner>/<repo>:latest（默认分支）/ :sha-xxxxxxx / :vX.Y.Z
+#
+# 平台：只构建 linux/amd64（GitHub runner 原生架构，编译快）。
+# 如需 arm64：把下面的 platforms 改成 "linux/amd64,linux/arm64" 并恢复
+# setup-qemu 步骤——注意 arm64 会走 QEMU 模拟，构建时间大幅增加。
 
 on:
   push:
@@ -25,9 +29,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU (arm64 交叉构建)
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -53,7 +54,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,11 +1,28 @@
+# Kiro-RS-Tool（fork）部署配置
+#
+# 镜像由 GitHub Actions 自动构建并推送到 GHCR：
+#   ghcr.io/xuhuanhello/kiro-rs-tool:latest
+# 首次部署：
+#   docker compose pull && docker compose up -d
+#
+# 若包仍是私有（GHCR 默认私有），先在 VPS 上登录：
+#   echo <PAT> | docker login ghcr.io -u xuhuanhello --password-stdin
+# 或在 GitHub 的 Packages 设置里把该包改为 public。
+#
+# 环境变量：
+#   KIRO_RS_IMAGE  覆盖镜像地址（例如用本地构建的 kiro-rs:fork）
+#   KIRO_RS_BIND   监听地址，默认 127.0.0.1（仅本机）。
+#                  要对公网提供服务，建议保持默认并前置 Nginx/Caddy 做 TLS 反代；
+#                  直接改成 0.0.0.0 会把代理暴露到公网，务必确认 apiKey 足够强。
 services:
   kiro-rs:
-    image: ${KIRO_RS_IMAGE:-zyphrzero/kiro-rs:latest}
+    image: ${KIRO_RS_IMAGE:-ghcr.io/xuhuanhello/kiro-rs-tool:latest}
     container_name: kiro-rs
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "8990:8990"
+      - "${KIRO_RS_BIND:-127.0.0.1}:8990:8990"
     volumes:
+      # config.json / credentials.json / traces.db / usage_log.*.jsonl 都在这里
       - ./data/:/app/config/
     restart: unless-stopped

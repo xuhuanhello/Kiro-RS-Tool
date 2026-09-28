@@ -290,7 +290,7 @@ impl KiroProvider {
                         "MCP 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
                         max_retries,
-                        e
+                        crate::common::error::chain(&e)
                     );
                     self.invalidate_client_for(&ctx.credentials);
                     last_error = Some(e.into());
@@ -515,7 +515,9 @@ impl KiroProvider {
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
             let request = request
                 .build()
-                .map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("构建请求失败: {}", crate::common::error::chain(&e))
+                })?;
             if tracing::enabled!(tracing::Level::DEBUG) {
                 for (k, v) in request.headers() {
                     let value = v.to_str().unwrap_or("<binary>");
@@ -529,11 +531,14 @@ impl KiroProvider {
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
+                    // reqwest 的 Display 只有笼统说明，根因（DNS/连接重置/TLS）
+                    // 在 source 链上，必须一起打出来
+                    let detail = crate::common::error::chain(&e);
                     tracing::warn!(
                         "API 请求发送失败（尝试 {}/{}）: {}",
                         attempt + 1,
                         max_retries,
-                        e
+                        detail
                     );
                     Self::emit_attempt(
                         sink,
@@ -542,7 +547,7 @@ impl KiroProvider {
                         endpoint_name,
                         None,
                         outcome::NETWORK_ERROR,
-                        Some(&e.to_string()),
+                        Some(&detail),
                         attempt_start,
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"

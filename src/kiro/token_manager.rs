@@ -1276,10 +1276,11 @@ impl MultiTokenManager {
                             // 找到新 Token，不计入失败次数，直接重试
                             continue;
                         }
-                        tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
+                        // {:#} 展开 anyhow 的 source 链，否则只有顶层说明
+                        tracing::warn!("凭据 #{} refreshToken 永久失效: {:#}", id, e);
                         self.report_refresh_token_invalid(id)
                     } else {
-                        tracing::warn!("凭据 #{} Token 刷新失败: {}", id, e);
+                        tracing::warn!("凭据 #{} Token 刷新失败: {:#}", id, e);
                         self.report_refresh_failure(id)
                     };
                     attempt_count += 1;

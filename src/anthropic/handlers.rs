@@ -378,7 +378,9 @@ fn conversion_error_response(e: &ConversionError) -> (&'static str, String) {
 }
 
 fn provider_error_status_and_detail(err: &Error) -> (StatusCode, &'static str, String) {
-    let err_str = err.to_string();
+    // 用 {:#} 展开 anyhow 的 source 链：上游失败的真实原因常在链尾，
+    // 只打顶层信息会让排查失去依据
+    let err_str = format!("{:#}", err);
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
@@ -1108,7 +1110,10 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, cache_plan, pending_initial_events, provider, safeguards)))
                         }
                         Some(Err(e)) => {
-                            tracing::error!("读取响应流失败: {}", e);
+                            tracing::error!(
+                                "读取响应流失败: {}",
+                                crate::common::error::chain(&e)
+                            );
                             // 发送最终事件并结束（记为 error）
                             let mut final_events = pending_initial_events.take().unwrap_or_default();
                             final_events.extend(ctx.generate_final_events());
@@ -1117,7 +1122,7 @@ fn create_sse_stream(
                             tracer.finalize(
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
-                                Some(&e.to_string()),
+                                Some(&crate::common::error::chain(&e)),
                                 Some(sent_bytes),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
@@ -1235,12 +1240,12 @@ async fn handle_non_stream_request(
     let body_bytes = match response.bytes().await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!("读取响应体失败: {}", e);
+            tracing::error!("读取响应体失败: {}", crate::common::error::chain(&e));
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize(
                 "interrupted",
                 Some(outcome::STREAM_INTERRUPTED),
-                Some(&e.to_string()),
+                Some(&crate::common::error::chain(&e)),
                 None,
             );
             return (

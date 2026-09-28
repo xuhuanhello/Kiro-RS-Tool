@@ -57,6 +57,17 @@ impl ClientCache {
         self.map.get(key).cloned()
     }
 
+    /// 丢弃某个 key 的缓存 client
+    ///
+    /// 用于传输层失败后强制重建连接池：否则后续重试会一直复用同一个已死的
+    /// 连接池（休眠唤醒、切换网络、NAT 映射过期后都会出现），导致每一次尝试
+    /// 都快速失败，整个请求最终报 network_error。
+    fn invalidate(&mut self, key: &Option<ProxyConfig>) {
+        if self.map.remove(key).is_some() {
+            self.order.retain(|k| k != key);
+        }
+    }
+
     /// 插入新条目，必要时淘汰最旧的非受保护条目
     fn insert(&mut self, key: Option<ProxyConfig>, client: Client) {
         if key == self.protected || self.map.contains_key(&key) {
@@ -169,6 +180,16 @@ impl KiroProvider {
         Ok(client)
     }
 
+    /// 丢弃该凭据对应的缓存 client（下一次 client_for 会重建连接池）
+    ///
+    /// 传输层失败时调用。长时间运行的进程在休眠唤醒 / 切换网络后，连接池里
+    /// 的连接可能已经失效但未被子协议察觉，此时若继续复用，重试会全部失败。
+    fn invalidate_client_for(&self, credentials: &KiroCredentials) {
+        let global_proxy = self.global_proxy.read().clone();
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
+        self.client_cache.lock().invalidate(&effective);
+    }
+
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
         let default_endpoint = self.default_endpoint.read().clone();
@@ -271,6 +292,7 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    self.invalidate_client_for(&ctx.credentials);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt, &retry_policy)).await;
@@ -525,6 +547,10 @@ impl KiroProvider {
                     );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    //
+                    // 但必须丢弃缓存的 client：连接池里的连接可能已死（休眠唤醒、
+                    // 切换网络后），继续复用会让所有重试都快速失败。
+                    self.invalidate_client_for(&ctx.credentials);
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt, &retry_policy)).await;
@@ -979,3 +1005,54 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy(url: &str) -> Option<ProxyConfig> {
+        Some(ProxyConfig::new(url))
+    }
+
+    #[test]
+    fn client_cache_invalidate_forces_rebuild() {
+        let direct: Option<ProxyConfig> = None;
+        let mut cache = ClientCache::new(direct.clone(), Client::new(), 4);
+        assert!(cache.get(&direct).is_some(), "初始条目应命中");
+
+        cache.invalidate(&direct);
+        assert!(
+            cache.get(&direct).is_none(),
+            "invalidate 之后必须缓存未命中，下一次 client_for 才会重建连接池"
+        );
+
+        // 重建后可再次命中，且受保护 key 不应进入淘汰队列
+        cache.insert(direct.clone(), Client::new());
+        assert!(cache.get(&direct).is_some());
+        assert!(cache.order.iter().all(|k| k != &direct));
+    }
+
+    #[test]
+    fn client_cache_invalidate_clears_eviction_order() {
+        let mut cache = ClientCache::new(None, Client::new(), 2);
+        let p = proxy("socks5://127.0.0.1:1080");
+        cache.insert(p.clone(), Client::new());
+        assert!(cache.get(&p).is_some());
+
+        cache.invalidate(&p);
+        assert!(cache.get(&p).is_none());
+        assert!(
+            cache.order.iter().all(|k| k != &p),
+            "淘汰队列也要清理，否则容量统计会失真"
+        );
+    }
+
+    #[test]
+    fn client_cache_invalidate_missing_key_is_noop() {
+        let mut cache = ClientCache::new(None, Client::new(), 2);
+        let p = proxy("http://127.0.0.1:9999");
+        cache.invalidate(&p); // 不存在，不应 panic
+        assert!(cache.get(&None).is_some(), "不应影响其他条目");
+    }
+}
+

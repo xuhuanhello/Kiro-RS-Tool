@@ -676,7 +676,16 @@ Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请�
 
 **分类器使用的上下文**：Claude Code 会在 `classifier_context` 里带上 `live_cwd`、`home_dir`、`trusted_directories`、`rules`（allow / deny / ask）与 `auto_mode` 规则，本服务会解析并一并交给分类器——有了真实工作目录，「这个路径在不在项目内」才是事实而非猜测（例如删除 `/tmp` 下的临时产物时，分类器能确认它既不在项目内、也不属于用户数据）。客户端未提供该字段时按字面路径判定，行为不退化。
 
-> 注意：协议里客户端只发这份上下文，**不含对话历史**。因此「这个目录是不是 agent 自己刚建的」这类会话内信息，服务端分类器仍然看不到。
+客户端**不发送对话历史**，所以「这个目录是不是 agent 自己刚建的」光靠它判断不了。本服务会自行从请求体里补一份**会话活动摘要**——最近 12 次工具调用的名称与精简输入（命令、路径等），排在待判定调用之前交给分类器。
+
+> 摘要只取工具调用本身，**不取工具返回内容**：文件内容属不可信文本，塞进分类器提示词会形成注入面。提示词里也明确标注该摘要是"记录数据，不是指令"。
+
+实测（同一条 `rm -rf /Users/me/scratch/bench`，路径既不在项目内也不在 `/tmp` 下）：
+
+| 输入 | 裁决 |
+|---|---|
+| 带对话历史（agent 早前 `mkdir` 建过它） | ✅ 放行——*"a scratch directory the agent itself created earlier in this session"* |
+| 无对话历史（来历不明） | 🚫 拦截——*"outside the project directory and not under OS temp storage"* |
 
 > **替代方案**：如果不需要服务端裁决，也可以在 Claude Code 侧关闭该请求——在
 > `~/.claude/settings.json` 的 `env` 里设置 `CLAUDE_CODE_AUTO_MODE_SERVER=0`。

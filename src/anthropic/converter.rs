@@ -213,6 +213,9 @@ const KNOWN_MODEL_VERSIONS: &[(ModelFamily, u32, u32, &str)] = &[
     (ModelFamily::Sonnet, 5, 0, "claude-sonnet-5"),
     (ModelFamily::Sonnet, 4, 6, "claude-sonnet-4.6"),
     (ModelFamily::Sonnet, 4, 5, "claude-sonnet-4.5"),
+    // 2026-09-29 实测上游 ListAvailableModels 仍提供 claude-sonnet-4；此前漏配，
+    // 导致这个上游确实存在的模型在本地被判为「模型不支持」
+    (ModelFamily::Sonnet, 4, 0, "claude-sonnet-4"),
     (ModelFamily::Opus, 5, 5, "claude-opus-5.5"),
     (ModelFamily::Opus, 5, 0, "claude-opus-5"),
     (ModelFamily::Opus, 4, 8, "claude-opus-4.8"),
@@ -1947,6 +1950,23 @@ mod tests {
                 .unwrap_or_else(|| panic!("{m} 应支持 native reasoning schema"));
             assert!(schema.efforts.contains(&"xhigh"), "{m} 应允许 xhigh");
         }
+    }
+
+    #[test]
+    fn test_map_model_supports_sonnet_4() {
+        // 上游 ListAvailableModels 仍提供 claude-sonnet-4（无小版本）。
+        // 此前 KNOWN_MODEL_VERSIONS 漏了这一条，导致上游确实存在的模型在本地
+        // 被判成「模型不支持」。
+        assert_eq!(map_model("claude-sonnet-4").as_deref(), Some("claude-sonnet-4"));
+        // 点号与短横写法都应接受
+        assert_eq!(map_model("claude-sonnet-4.0").as_deref(), Some("claude-sonnet-4"));
+        assert_eq!(map_model("claude-sonnet-4-0").as_deref(), Some("claude-sonnet-4"));
+        // 带 -thinking 后缀仍走同一条映射
+        assert_eq!(
+            map_model("claude-sonnet-4-thinking").as_deref(),
+            Some("claude-sonnet-4")
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-4"), 200_000);
     }
 
     #[test]

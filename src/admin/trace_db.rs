@@ -145,6 +145,64 @@ pub struct TraceQuery {
     pub offset: usize,
 }
 
+/// 裁决表最多保留的行数（按 id 从新到旧保留；兜底防止长时间运行撑爆磁盘）
+const MAX_VERDICT_ROWS: u64 = 20_000;
+
+/// 一条分类器裁决记录
+///
+/// 与 trace 通过 `trace_id` 关联：一个请求可能产生多条（每个会产生真实后果的
+/// 工具调用一条）。Windows 上「整类命令被拦」的排查就靠这张表——谁判的、判了什么、
+/// 理由是什么、是否命中缓存、耗多久，一眼可见。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassifierVerdictRecord {
+    /// 自增主键（写入时忽略，查询时回填）
+    #[serde(default)]
+    pub id: u64,
+    /// 判定时间（RFC3339）
+    pub ts: String,
+    /// 判定时间（epoch 秒），用于排序与筛选
+    #[serde(default)]
+    pub ts_epoch: i64,
+    /// 关联的请求链路 id
+    pub trace_id: String,
+    /// 客户端 Key id；0 表示 master apiKey
+    pub key_id: u64,
+    /// 分类器使用的模型
+    pub model: String,
+    /// 工具名（Bash / PowerShell / Write / mcp__x__run …）
+    pub tool_name: String,
+    /// 命令摘要（由 safeguards 侧截断到固定长度）
+    pub command_preview: Option<String>,
+    /// 解开 `-EncodedCommand` 后的明文（未解码时为 None）
+    pub decoded_command: Option<String>,
+    /// 是否被拦截
+    pub flagged: bool,
+    /// 判定理由（模型给的一句话）
+    pub reason: Option<String>,
+    /// 是否命中进程内缓存（命中时 duration_ms 为 0）
+    pub cached: bool,
+    /// 本次判定耗时（毫秒）
+    pub duration_ms: u64,
+    /// 客户端上报的平台（win32 / darwin …）
+    pub platform: Option<String>,
+    /// 判定时的工作目录
+    pub live_cwd: Option<String>,
+}
+
+/// 裁决查询条件
+#[derive(Debug, Default, Clone)]
+pub struct ClassifierVerdictQuery {
+    /// 只看被拦截的
+    pub only_flagged: bool,
+    /// 对命令 / 工具名 / 理由做不区分大小写的子串匹配
+    pub search: Option<String>,
+    /// 返回条数上限
+    pub limit: usize,
+    /// 偏移量（分页用）
+    pub offset: usize,
+}
+
 /// SQLite 持久化存储
 pub struct TraceStore {
     conn: Mutex<Connection>,
@@ -288,6 +346,131 @@ impl TraceStore {
                 tracing::warn!("trace 写入失败: {}", e);
             }
         }
+    }
+
+    /// 写入一条分类器裁决。store 关闭时短路；失败仅 warn，不影响请求。
+    pub fn insert_classifier_verdict(&self, rec: &ClassifierVerdictRecord) {
+        if !self.is_enabled() {
+            return;
+        }
+        let ts_epoch = if rec.ts_epoch > 0 {
+            rec.ts_epoch
+        } else {
+            Utc::now().timestamp()
+        };
+        let conn = self.conn.lock();
+        if let Err(e) = conn.execute(
+            "INSERT INTO classifier_verdicts (ts, ts_epoch, trace_id, key_id, model, tool_name, \
+             command_preview, decoded_command, flagged, reason, cached, duration_ms, platform, live_cwd) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            rusqlite::params![
+                rec.ts,
+                ts_epoch,
+                rec.trace_id,
+                rec.key_id as i64,
+                rec.model,
+                rec.tool_name,
+                rec.command_preview,
+                rec.decoded_command,
+                rec.flagged as i64,
+                rec.reason,
+                rec.cached as i64,
+                rec.duration_ms as i64,
+                rec.platform,
+                rec.live_cwd,
+            ],
+        ) {
+            tracing::warn!("分类器裁决写入失败: {}", e);
+        }
+    }
+
+    /// 查询分类器裁决：返回 (当前页记录, 命中总数)。仅 warn 失败，返回 (空, 0)。
+    pub fn query_classifier_verdicts(
+        &self,
+        q: &ClassifierVerdictQuery,
+    ) -> (Vec<ClassifierVerdictRecord>, usize) {
+        let conn = self.conn.lock();
+        match Self::query_verdicts_inner(&conn, q) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("分类器裁决查询失败: {}", e);
+                (Vec::new(), 0)
+            }
+        }
+    }
+
+    fn query_verdicts_inner(
+        conn: &Connection,
+        q: &ClassifierVerdictQuery,
+    ) -> rusqlite::Result<(Vec<ClassifierVerdictRecord>, usize)> {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if q.only_flagged {
+            clauses.push("flagged = 1".to_string());
+        }
+        // 用 instr(lower(...)) 而不是 LIKE：搜索词里的 % / _ 不会被当成通配符，
+        // 也不需要 ESCAPE 子句，少一处转义就能少一处错。
+        if let Some(term) = q.search.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            clauses.push(
+                "(instr(lower(command_preview), lower(?)) > 0 \
+                 OR instr(lower(decoded_command), lower(?)) > 0 \
+                 OR instr(lower(tool_name), lower(?)) > 0 \
+                 OR instr(lower(reason), lower(?)) > 0)"
+                    .to_string(),
+            );
+            for _ in 0..4 {
+                params.push(Box::new(term.to_string()));
+            }
+        }
+
+        let where_sql = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", clauses.join(" AND "))
+        };
+
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM classifier_verdicts{where_sql}"),
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |row| row.get(0),
+        )?;
+
+        let mut bound = params;
+        bound.push(Box::new(q.limit.clamp(1, 500) as i64));
+        bound.push(Box::new(q.offset as i64));
+
+        let sql = format!(
+            "SELECT id, ts, ts_epoch, trace_id, key_id, model, tool_name, command_preview, \
+             decoded_command, flagged, reason, cached, duration_ms, platform, live_cwd \
+             FROM classifier_verdicts{where_sql} \
+             ORDER BY ts_epoch DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(bound.iter().map(|p| p.as_ref())),
+            |row| {
+                Ok(ClassifierVerdictRecord {
+                    id: row.get::<_, i64>(0)? as u64,
+                    ts: row.get(1)?,
+                    ts_epoch: row.get(2)?,
+                    trace_id: row.get(3)?,
+                    key_id: row.get::<_, i64>(4)? as u64,
+                    model: row.get(5)?,
+                    tool_name: row.get(6)?,
+                    command_preview: row.get(7)?,
+                    decoded_command: row.get(8)?,
+                    flagged: row.get::<_, i64>(9)? != 0,
+                    reason: row.get(10)?,
+                    cached: row.get::<_, i64>(11)? != 0,
+                    duration_ms: row.get::<_, i64>(12)? as u64,
+                    platform: row.get(13)?,
+                    live_cwd: row.get(14)?,
+                })
+            },
+        )?;
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((records, total as usize))
     }
 
     /// 分页查询：返回 (当前页记录, 符合条件的总数)。仅 warn 失败，返回 (空, 0)。
@@ -437,6 +620,16 @@ impl TraceStore {
                 [cutoff],
             )?;
             let n = tx.execute("DELETE FROM traces WHERE ts_epoch < ?1", [cutoff])?;
+            // 裁决表按同一保留期清理；再按行数兜底，避免高频判定把库撑大
+            tx.execute(
+                "DELETE FROM classifier_verdicts WHERE ts_epoch < ?1",
+                [cutoff],
+            )?;
+            tx.execute(
+                "DELETE FROM classifier_verdicts WHERE id NOT IN \
+                 (SELECT id FROM classifier_verdicts ORDER BY id DESC LIMIT ?1)",
+                [MAX_VERDICT_ROWS as i64],
+            )?;
             Ok(n)
         })();
         match res {
@@ -559,6 +752,26 @@ CREATE TABLE IF NOT EXISTS trace_attempts (
     PRIMARY KEY (trace_id, attempt)
 );
 CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
+
+CREATE TABLE IF NOT EXISTS classifier_verdicts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    ts_epoch        INTEGER NOT NULL,
+    trace_id        TEXT NOT NULL,
+    key_id          INTEGER NOT NULL,
+    model           TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    command_preview TEXT,
+    decoded_command TEXT,
+    flagged         INTEGER NOT NULL,
+    reason          TEXT,
+    cached          INTEGER NOT NULL,
+    duration_ms     INTEGER NOT NULL,
+    platform        TEXT,
+    live_cwd        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_cv_ts ON classifier_verdicts(ts_epoch DESC);
+CREATE INDEX IF NOT EXISTS idx_cv_flagged ON classifier_verdicts(flagged, ts_epoch DESC);
 ";
 
 #[cfg(test)]
@@ -717,6 +930,99 @@ mod tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trace_id, "recent");
+    }
+
+    fn sample_verdict(trace_id: &str, flagged: bool) -> ClassifierVerdictRecord {
+        ClassifierVerdictRecord {
+            id: 0,
+            ts: Utc::now().to_rfc3339(),
+            ts_epoch: Utc::now().timestamp(),
+            trace_id: trace_id.to_string(),
+            key_id: 1,
+            model: "claude-sonnet-5".to_string(),
+            tool_name: "PowerShell".to_string(),
+            command_preview: Some("Stop-Service -Name Spooler".to_string()),
+            decoded_command: None,
+            flagged,
+            reason: Some(if flagged {
+                "Stops a system service, a system-wide state change.".to_string()
+            } else {
+                "Read-only listing.".to_string()
+            }),
+            cached: false,
+            duration_ms: 1830,
+            platform: Some("win32".to_string()),
+            live_cwd: Some("C:\\Users\\me\\proj".to_string()),
+        }
+    }
+
+    #[test]
+    fn classifier_verdict_roundtrip_and_filters() {
+        let store = mem_store();
+        let mut ok = sample_verdict("t1", false);
+        ok.command_preview = Some("Get-ChildItem -Force".to_string());
+        ok.ts_epoch = 100;
+        store.insert_classifier_verdict(&ok);
+        let mut bad = sample_verdict("t2", true);
+        bad.ts_epoch = 200;
+        store.insert_classifier_verdict(&bad);
+
+        let (all, total) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(total, 2);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].trace_id, "t2", "新的在前");
+        assert!(all[0].flagged);
+        assert_eq!(all[0].platform.as_deref(), Some("win32"));
+        assert_eq!(all[0].duration_ms, 1830);
+
+        let (flagged, total) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            only_flagged: true,
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(flagged[0].trace_id, "t2");
+
+        // 搜索命中理由 / 命令，且不区分大小写
+        let (hit, _) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            search: Some("SYSTEM SERVICE".to_string()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].trace_id, "t2");
+
+        let (hit, _) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            search: Some("get-childitem".to_string()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].trace_id, "t1");
+
+        // 搜索词里的 % 不当通配符（用 instr 而不是 LIKE 的原因）
+        let (none, _) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            search: Some("%".to_string()),
+            limit: 50,
+            ..Default::default()
+        });
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn classifier_verdict_skips_insert_when_disabled() {
+        let store = mem_store();
+        store.set_enabled(false);
+        store.insert_classifier_verdict(&sample_verdict("t1", true));
+        let (items, total) = store.query_classifier_verdicts(&ClassifierVerdictQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
     }
 
     #[test]

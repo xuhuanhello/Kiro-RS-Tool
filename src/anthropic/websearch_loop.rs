@@ -737,42 +737,16 @@ pub(super) async fn run_web_search_loop(
 ///
 /// 安全约束：只有真实分类产出的裁决才会以 evaluated 形式下发；分类失败或未
 /// 覆盖的工具一律不下发（空表），由客户端自己的分类器兜底。
+///
+/// 具体逻辑在 [`super::safeguards::results_for_content`]，与非流式响应共用同一条
+/// 路径——两条分支对「什么时候回空表」必须给出一致答案。
 async fn build_safeguard_results(
     provider: &Arc<KiroProvider>,
     safeguards: &super::safeguards::SafeguardsPlan,
     content: &[Value],
+    sink: Option<&dyn super::safeguards::VerdictSink>,
 ) -> Option<Value> {
-    use super::safeguards::SafeguardsPlan;
-
-    match safeguards {
-        SafeguardsPlan::Off => None,
-        SafeguardsPlan::Deferred => Some(super::safeguards::deferred_results()),
-        SafeguardsPlan::Classify { settings, context } => {
-            let tool_uses: Vec<(String, String, Value)> = content
-                .iter()
-                .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
-                .filter_map(|b| {
-                    Some((
-                        b.get("id")?.as_str()?.to_string(),
-                        b.get("name")?.as_str()?.to_string(),
-                        b.get("input").cloned().unwrap_or(Value::Null),
-                    ))
-                })
-                .collect();
-
-            if tool_uses.is_empty() {
-                return Some(super::safeguards::deferred_results());
-            }
-
-            let verdicts =
-                super::safeguards::classify(provider, settings, context, &tool_uses).await;
-            if verdicts.is_empty() {
-                Some(super::safeguards::deferred_results())
-            } else {
-                Some(super::safeguards::build_results(&verdicts))
-            }
-        }
-    }
+    super::safeguards::results_for_content(provider, safeguards, content, sink).await
 }
 
 async fn render_deferred_sse(
@@ -789,8 +763,10 @@ async fn render_deferred_sse(
 
     tokio::spawn(async move {
         let mut marker = StreamFirstByteMarker::new(tx.clone(), startup_tx);
-        // 分类器需要在流结束时再调一次模型，先留一份 provider
+        // 分类器需要在流结束时再调一次模型，先留一份 provider；
+        // tracer 会被 loop 消费，另留一份用于把裁决写进审计表
         let provider_for_classifier = provider.clone();
+        let tracer_for_classifier = tracer.clone();
         let result = run_web_search_loop_inner(
             provider,
             payload,
@@ -809,6 +785,7 @@ async fn render_deferred_sse(
                     &provider_for_classifier,
                     &safeguards,
                     &success.content,
+                    Some(&*tracer_for_classifier),
                 )
                 .await;
                 for event in build_sse_events(

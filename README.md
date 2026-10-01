@@ -666,9 +666,13 @@ Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请�
 | `safeguardsClassifierEnabled: false`（默认） | 不下发任何裁决 → 每个工具调用仍由 Claude Code 自己的分类器审查，**零额外延迟** |
 | `safeguardsClassifierEnabled: true` | 会**改变实际后果**的工具多跑一次模型判定，每个含此类调用的响应约 +1~3s |
 
-**服务端分类覆盖哪些工具**：命令执行（`Bash` / `*shell*` / `*terminal*` / `*exec*`）、文件写入与编辑（`Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `mcp__*__write_file`）、网络读写（`*fetch*` / `*http*` / `*upload*` / `*download*`）。
+**服务端分类覆盖哪些工具**：命令执行（`Bash` / `PowerShell` / `pwsh` / `cmd` / `*shell*` / `*terminal*` / `*exec*` / `*command*`）、文件写入与编辑（`Write` / `Edit` / `MultiEdit` / `NotebookEdit` / `mcp__*__write_file`）、网络读写（`*fetch*` / `*http*` / `*upload*` / `*download*`）。
 
 未覆盖的（`Read` / `Grep` / `Glob` / `TodoWrite` 等没有破坏性效果的工具）一律以 `skipped` 表达，交回客户端自己的分类器——多跑一次判定只是白白增加延迟。
+
+**判据不只看工具名**：任何 `tool_use` 的入参里带 `command` / `cmd` / `script` / `command_line` / `shell_command` 这类命令字段时，无论工具叫什么名字都会分类。这样 MCP 命令工具、将来改名的 shell 工具（Windows 上的 `PowerShell` 就是这一类）都能拿到裁决，而不是因为"名字没在名单里"退化成无裁决。
+
+**流式与非流式都会回传裁决**：流式走 `message_delta.delta.safeguard_results`，非流式走响应体顶层的 `safeguard_results`。Claude Code 的流看门狗在流中断时会回退到非流式请求，少了这一份它同样只能退回本地分类器。
 
 **分类结果缓存**：同一份「工具 + 输入 + 工作目录 + 用户拒绝规则」的**放行**裁决会在进程内缓存（LRU 上限 512 条，10 分钟过期），重复命令直接复用。实测同一命令连发三次：`5.87s → 3.50s → 2.33s`。
 
@@ -694,6 +698,37 @@ Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请�
 |---|---|
 | 带对话历史（agent 早前 `mkdir` 建过它） | ✅ 放行——*"a scratch directory the agent itself created earlier in this session"* |
 | 无对话历史（来历不明） | 🚫 拦截——*"outside the project directory and not under OS temp storage"* |
+
+### Windows / PowerShell
+
+Windows 上 Claude Code 可能走两条路，网关两条都要覆盖：
+
+- **PowerShell 工具**（`CLAUDE_CODE_USE_POWERSHELL_TOOL`；未找到 Git Bash 时默认开启，找到 Git Bash 时也可用该变量或灰度开关启用），工具名里没有 `Bash`；
+- **Bash 工具里显式调用 PowerShell**——机器上装了 Git Bash 时更常见：日常命令走 `Bash`，只有需要 PowerShell 的场景（服务、注册表、`.ps1` 脚本、MSBuild 等）才写成 `pwsh -NoProfile -Command '...'`。
+
+分类器为此做了四件事：
+
+- **按实际后果判定，而不是按方言**：提示词明确 `$env:NAME` / `%TEMP%` / `$(...)` / 反引号是这些 shell 的变量与命令替换写法，出现它们本身不代表「目标无法确定」；`-Force` / `-Recurse` / `-Confirm:$false` 是普通开关；`Set-ExecutionPolicy -Scope Process`（或 `-Scope CurrentUser`）只影响当前进程 / 当前用户，不是系统级改动。同时保留真实危险动作的拦截：`irm ... | iex`、`Invoke-Expression`、`DownloadString`、**解不出内容**的 `-EncodedCommand`、`New-Service` / `sc create`、`reg add HKLM\...`、`Set-MpPreference -Disable*`、`netsh advfirewall`、`schtasks /create`、`Add-Content $PROFILE`、`Format-Volume` / `diskpart`、`icacls ... /grant`、`wevtutil cl`、`Set-ExecutionPolicy -Scope LocalMachine`。
+- **上下文补上一次性存储位置**：客户端只发 `platform` / `home_dir`，服务端据此推出 `%TEMP%` / `%TMP%` / `$env:TEMP` / `$env:LOCALAPPDATA\Temp` / `C:\Windows\Temp` / `<home>\AppData\Local\Temp`；macOS / Linux 则给出 `$TMPDIR` / `/tmp` / `/var/folders` / `~/.cache`。平台无法确定时不下发这一行（宁可不写，也不把 `/tmp` 说成 Windows 机上的可信位置）。
+- **编码命令先解开再判**：`pwsh -EncodedCommand <base64>`（Claude Code 自己内部就是用 `-NoProfile -NonInteractive -EncodedCommand` 起 PowerShell 的）此前只能被当成"不透明命令"从严拦下。现在网关会解码（UTF-16LE 与 UTF-8 都试，且要求解出来确实像命令），把明文放进 `decoded_command` 一并交给分类器：**编码不是风险，内容才是**。解不出来时保持原样从严判定。
+- **路径的两种写法点破**：Windows 上 `live_cwd` 可能是 Git Bash 的 `/c/Users/me/proj`，而命令里写的是 `C:\Users\me\proj`。上下文里会补一行"这两种写法是同一个位置"，否则分类器会把项目内路径判成项目外。
+- **Windows 只读操作与状态变更分开**：`Get-Service` / `sc query` / `Get-EventLog` / `Get-CimInstance` / `reg query` / `winget list` 这类查询放行；`Set-Service` / `Start-Service` / `Stop-Service` / `sc config` / `Start-Process -Verb RunAs` 这类改机器状态的照旧拦截。项目内脚本（`.ps1` / `.cmd` / `.bat`）与 `pwsh -File` 执行它，按"跑项目自己的脚本"处理。
+
+拦截理由会写进日志（`safeguards 分类器: 判定 N 个工具 ... flagged=["toolu_x: 理由"]`），排查「整类命令被拦」时先看这一行。
+
+**裁决可视化**：每一次裁决——**放行也记**——都会连同工具名、命令原文、解码后的命令、理由、耗时、是否命中缓存、平台与工作目录写入 `traces.db` 的 `classifier_verdicts` 表，并用 `trace_id` 与请求链路对齐。Admin UI 新增「分类器裁决」页（`/admin` → 分类器裁决，hash 路由 `#/verdicts`）：可按命令 / 工具名 / 理由搜索、可只看拦截、5 秒自动刷新，命中缓存的条目单独标出，命令与理由都可能带密钥，落库前按既有规则脱敏。
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/admin/classifier-verdicts?onlyFlagged=true&search=encoded&limit=100&offset=0` | 逐条裁决（默认 100 条，上限 500） |
+
+保留策略与 trace 共用：超过 `traceRetentionDays` 天清除，另有 2 万行上限兜底；`traceEnabled=false` 时与 trace 一起停写。
+
+> **没有裁决会怎样**（Claude Code 2.1.286 取证）：某个 tool_use 在 `safeguard_results.tool_uses` 里缺失或被标成 `skipped` 时，客户端改用**它自己的本地分类器**判定；本地分类器也不可用时该动作被硬拦（*"Auto mode could not evaluate this action and is blocking it for safety"*，并提示不要重试）。Windows 上 `autoAllowBashIfSandboxed` 恒为关，每条 shell 调用都会走到这一步——所以 Windows 侧必须让代理真正下发裁决（`safeguardsClassifierEnabled: true`，且工具名要覆盖到 `PowerShell`）。
+>
+> 另有一条与分类器无关的 Windows 专属拦截：企业策略下 `sandbox.enabled` + `sandbox.enabledPlatforms` 含 `win32` + 严格模式时，PowerShell 工具会在权限检查**之前**以 "Shell command execution is blocked by policy" 拒绝（`errorCode 11`）。遇到这个文案要查沙箱配置，而不是分类器。
+
+> **回归用例**：`cargo test -- --ignored --nocapture live_windows_powershell_battery` 用真实模型跑一遍 Windows 命令（必须放行的日常命令 + 必须拦截的危险命令），默认被 `#[ignore]` 跳过（需要凭据与网络）。
 
 > **替代方案**：如果不需要服务端裁决，也可以在 Claude Code 侧关闭该请求——在
 > `~/.claude/settings.json` 的 `env` 里设置 `CLAUDE_CODE_AUTO_MODE_SERVER=0`。
@@ -727,8 +762,11 @@ Claude Code 在 auto 模式下会向服务端请求「分类器审查」：请�
   - `GET /api/admin/stats/by-credential?range=...` - 按上游凭据分布
   - `GET /api/admin/config/runtime` - 查看当前 `defaultEndpoint`、`toolCompatibilityMode` 与端点兼容版本
 
+- **分类器裁决 API**（auto 模式服务端审查的可视化）
+  - `GET /api/admin/classifier-verdicts?onlyFlagged=&search=&limit=&offset=` - 逐条裁决：工具名 / 命令原文 / 解码后命令 / 放行或拦截 / 理由 / 耗时 / 缓存命中 / 平台 / 工作目录
+
 - **Admin UI**（v0.4.0+ 升级为三 Tab SPA）
-  - `GET /admin` - 概览 / 凭据管理 / 客户端 Key
+  - `GET /admin` - 概览 / 凭据管理 / 客户端 Key / 请求日志 / 分类器裁决
   - 顶栏统一工具：负载均衡切换、刷新、在线更新、Key 管理（修改 Admin Key 与业务 API Key）
 
 ### 在线更新

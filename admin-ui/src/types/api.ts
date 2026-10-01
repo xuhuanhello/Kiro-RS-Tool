@@ -522,3 +522,53 @@ export interface FailureStats {
 
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
+
+// ============ 分类器裁决（Claude Code auto 模式服务端分类器） ============
+
+/** 服务端分类器对单次工具调用的裁决记录 */
+export interface ClassifierVerdict {
+  id: number
+  /** 裁决时间（RFC3339，带时区偏移） */
+  ts: string
+  /** 裁决时间（Unix 秒） */
+  tsEpoch: number
+  traceId: string
+  /** 发起请求的客户端 Key；0 = 管理员 / 未标识 */
+  keyId: number
+  model: string
+  /** 工具名，如 PowerShell / Bash / Edit */
+  toolName: string
+  /** 送入分类器的原始命令（后端已截断） */
+  commandPreview: string
+  /** 解码后的真实命令（如解开编码包装后）；null = 无解码结果 */
+  decodedCommand: string | null
+  /** true = 被拦截（拒绝执行），false = 放行 */
+  flagged: boolean
+  /** 分类器给出的理由；null = 未返回理由 */
+  reason: string | null
+  /** true = 命中分类器缓存（此时 durationMs 为 0） */
+  cached: boolean
+  durationMs: number
+  /** 客户端平台，如 win32 / darwin / linux；null = 未知 */
+  platform: string | null
+  /** 客户端实时工作目录；null = 未知 */
+  liveCwd: string | null
+}
+
+/** 分类器裁决查询参数 */
+export interface ClassifierVerdictQuery {
+  /** 默认 100，最大 500 */
+  limit?: number
+  /** 默认 0 */
+  offset?: number
+  /** 只返回被拦截的裁决 */
+  onlyFlagged?: boolean
+  /** 对 commandPreview / decodedCommand / toolName / reason 做不区分大小写子串匹配 */
+  search?: string
+}
+
+/** 分类器裁决分页响应 */
+export interface ClassifierVerdictPage {
+  items: ClassifierVerdict[]
+  total: number
+}

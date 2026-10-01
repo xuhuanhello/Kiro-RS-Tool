@@ -3,7 +3,7 @@ import { storage } from "@/lib/storage";
 import { LoginPage } from "@/components/login-page";
 import { Toaster } from "@/components/ui/sonner";
 import { Button } from "@/components/ui/button";
-import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText } from "lucide-react";
+import { Activity, KeyRound, Server, LogOut, Moon, Sun, ScrollText, ShieldCheck } from "lucide-react";
 import { TopbarTools } from "@/components/topbar-tools";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -37,8 +37,13 @@ const TraceLogPage = lazy(() =>
     default: m.TraceLogPage,
   })),
 );
+const VerdictsPage = lazy(() =>
+  import("@/components/verdicts-page").then((m) => ({
+    default: m.VerdictsPage,
+  })),
+);
 
-type Tab = "overview" | "credentials" | "keys" | "traces";
+type Tab = "overview" | "credentials" | "keys" | "traces" | "verdicts";
 
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   {
@@ -61,11 +66,22 @@ const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
     label: "请求日志",
     icon: <ScrollText className="h-3.5 w-3.5" />,
   },
+  {
+    key: "verdicts",
+    label: "分类器裁决",
+    icon: <ShieldCheck className="h-3.5 w-3.5" />,
+  },
 ];
 
 function readTabFromHash(): Tab {
   const h = window.location.hash.replace(/^#\/?/, "");
-  if (h === "credentials" || h === "keys" || h === "overview" || h === "traces")
+  if (
+    h === "credentials" ||
+    h === "keys" ||
+    h === "overview" ||
+    h === "traces" ||
+    h === "verdicts"
+  )
     return h;
   return "overview";
 }
@@ -206,6 +222,7 @@ function App() {
           )}
           {tab === "keys" && <ClientKeysPage />}
           {tab === "traces" && <TraceLogPage />}
+          {tab === "verdicts" && <VerdictsPage />}
         </Suspense>
       </main>
 

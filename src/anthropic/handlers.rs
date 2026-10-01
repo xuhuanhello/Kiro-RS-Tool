@@ -5,7 +5,9 @@ use std::pin::Pin;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
+use crate::admin::trace_db::{
+    ClassifierVerdictRecord, SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome,
+};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::image_resize::RequestImageLimits;
 use crate::kiro::model::events::Event;
@@ -228,6 +230,48 @@ impl RequestTracer {
 impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
+    }
+}
+
+/// 分类器裁决的落库通道
+///
+/// 与 trace 汇总走同一份 store：裁决是"逐工具"的明细，trace 是"逐请求"的汇总，
+/// 前端按 trace_id 就能把两者对上。store 为 None（未启用 Admin/trace）时空操作。
+impl super::safeguards::VerdictSink for RequestTracer {
+    fn record(&self, verdict: super::safeguards::ClassifierVerdict) {
+        let Some(store) = &self.store else { return };
+        let rec = ClassifierVerdictRecord {
+            id: 0,
+            ts: Utc::now().to_rfc3339(),
+            ts_epoch: Utc::now().timestamp(),
+            trace_id: self.trace_id.clone(),
+            key_id: self.key_id,
+            model: self.model.clone(),
+            tool_name: verdict.tool_name,
+            // 命令与理由都可能带出密钥（curl -H "Authorization: Bearer sk-..."），
+            // 落库前按既有规则脱敏
+            command_preview: verdict
+                .command_preview
+                .map(|c| crate::security::redact_text(&c)),
+            decoded_command: verdict
+                .decoded_command
+                .map(|c| crate::security::redact_text(&c)),
+            flagged: verdict.flagged,
+            reason: Some(crate::security::redact_text(&verdict.reason))
+                .filter(|r| !r.is_empty()),
+            cached: verdict.cached,
+            duration_ms: verdict.duration_ms,
+            platform: verdict.platform,
+            live_cwd: verdict.live_cwd,
+        };
+        // 同 finalize：SQLite 是同步阻塞调用，放到阻塞线程池，别占住 async worker
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let store = std::sync::Arc::clone(store);
+                handle.spawn_blocking(move || store.insert_classifier_verdict(&rec));
+            }
+            Err(_) => store.insert_classifier_verdict(&rec),
+        }
     }
 }
 
@@ -884,12 +928,20 @@ pub async fn post_messages(
             payload.model.clone(),
             false,
         ));
+        // 非流式同样要回传裁决：Claude Code 的流看门狗在流中断时会回退到非流式请求，
+        // 少这一份裁决它就只能退回自己的本地分类器。
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         handle_non_stream_request(
             provider,
             &request_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            safeguards,
             tool_name_map,
             hook,
             cache_plan,
@@ -1146,6 +1198,7 @@ fn create_sse_stream(
                                     settings,
                                     context,
                                     &ctx.collected_tool_uses,
+                                    Some(&*tracer),
                                 )
                                 .await;
                                 if !verdicts.is_empty() {
@@ -1218,6 +1271,7 @@ async fn handle_non_stream_request(
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
+    safeguards: super::safeguards::SafeguardsPlan,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     cache_plan: CacheUsagePlan,
@@ -1466,6 +1520,13 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
+    // auto 模式服务端分类器审查：非流式响应在**响应体顶层**回传裁决
+    // （客户端从 message 对象上读 safeguard_results）。分类耗时只在真有
+    // 需要裁决的工具调用时产生。
+    let safeguard_results =
+        super::safeguards::results_for_content(&provider, &safeguards, &content, Some(&*tracer))
+            .await;
+
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
@@ -1475,7 +1536,7 @@ async fn handle_non_stream_request(
         cache_plan.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
-    let response_body = json!({
+    let mut response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -1490,6 +1551,10 @@ async fn handle_non_stream_request(
             "cache_read_input_tokens": cache_read_tokens
         }
     });
+    // 客户端请求了服务端审查（safeguards）时，非流式响应同样要带上裁决
+    if let Some(results) = safeguard_results {
+        response_body["safeguard_results"] = results;
+    }
 
     hook.record(
         credential_id,
@@ -1839,12 +1904,19 @@ pub async fn post_messages_cc(
             payload.model.clone(),
             false,
         ));
+        // 同 /v1/messages：非流式响应也必须带上 safeguard_results
+        let safeguards = super::safeguards::plan_for(
+            state.safeguards_enabled,
+            state.safeguards_classifier.as_ref(),
+            &payload,
+        );
         handle_non_stream_request(
             provider,
             &request_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
+            safeguards,
             tool_name_map,
             hook,
             cache_plan,

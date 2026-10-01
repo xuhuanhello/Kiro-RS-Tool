@@ -9,7 +9,7 @@ use axum::{
 use super::{
     client_keys::display_client_key,
     middleware::AdminState,
-    trace_db::TraceQuery,
+    trace_db::{ClassifierVerdictQuery, DEFAULT_QUERY_LIMIT, TraceQuery},
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
@@ -1111,6 +1111,62 @@ pub async fn list_traces(
         })
         .collect();
     Json(serde_json::json!({ "records": enriched, "total": total }))
+}
+
+/// GET /api/admin/classifier-verdicts
+///
+/// 查询 auto 模式服务端分类器的逐条裁决——每一次「谁判的、判了什么、为什么、
+/// 是否命中缓存、耗多久」都落在这张表里，Windows 上排查误拦靠它。
+/// query 参数：onlyFlagged / search / limit / offset
+/// 返回：{ items: [...], total: N }
+pub async fn list_classifier_verdicts(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let query = ClassifierVerdictQuery {
+        only_flagged: params
+            .get("onlyFlagged")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        search: params
+            .get("search")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        limit: params
+            .get("limit")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_QUERY_LIMIT)
+            .min(500),
+        offset: params
+            .get("offset")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0),
+    };
+    let (items, total) = state.trace_store.query_classifier_verdicts(&query);
+
+    // 附上凭据 email：与 traces 页面一致，看到 keyId 能直接对上是谁的调用
+    let snapshot = state.service.get_all_credentials();
+    let email_by_key: std::collections::HashMap<u64, Option<String>> = snapshot
+        .credentials
+        .iter()
+        .map(|c| (c.id, c.email.clone()))
+        .collect();
+
+    let enriched: Vec<serde_json::Value> = items
+        .into_iter()
+        .map(|v| {
+            let mut value = serde_json::to_value(&v).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "keyEmail".to_string(),
+                    serde_json::json!(email_by_key.get(&v.key_id).cloned().flatten()),
+                );
+            }
+            value
+        })
+        .collect();
+
+    Json(serde_json::json!({ "items": enriched, "total": total }))
 }
 
 /// GET /api/admin/traces/failure-stats

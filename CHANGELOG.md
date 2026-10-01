@@ -6,8 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### ✨ 新增
+
+- **分类器裁决可视化**：每一次 auto 模式服务端裁决（**放行也记**）都会连同工具名、命令原文、解码后的命令、理由、耗时、是否命中缓存、平台与工作目录写入 `traces.db` 的 `classifier_verdicts` 表，并用 `trace_id` 与请求链路对齐（`RequestTracer` 实现 `VerdictSink`，写入走阻塞线程池，不占 async worker）。新增 Admin API `GET /api/admin/classifier-verdicts`（`onlyFlagged` / `search` / `limit` / `offset`，搜索用 `instr` 而非 `LIKE`，`%` 不当通配符），以及 Admin UI 的「分类器裁决」页：搜索、只看拦截、分页、5 秒刷新，解码前后的命令并排显示，缓存命中单独标注。命令与理由落库前按既有 `redact_text` 规则脱敏；保留策略与 trace 共用（`traceRetentionDays` + 2 万行上限）。
+
 ### 🛠 修复
 
+- **Windows / PowerShell 误拦**：Windows 上 Claude Code 的 shell 工具是 PowerShell（未找到 Git Bash 时），此前的分类器提示词只有 POSIX 语境——`$env:TEMP` 被当成「无法确定的目标」、`Copy-Item -Force` 被当成「覆盖用户数据」、`Set-ExecutionPolicy -Scope Process` 被当成系统级改动，表现为整类 PowerShell 命令被拦。现在提示词按「实际后果」判定并覆盖 PowerShell / cmd 语义（变量与命令替换、`-Force` / `-Recurse`、执行策略作用域、`irm | iex` 等真实危险动作照旧拦截），上下文里补充平台相关的一次性存储位置（`%TEMP%` / `$env:TEMP` / `<home>\AppData\Local\Temp`，macOS 为 `$TMPDIR` / `/tmp` / `/var/folders`），并把工具的覆盖范围显式扩展到 `PowerShell` / `pwsh` / `cmd` / `*command*`。
+- **Windows 命令的归一化（`-EncodedCommand` 与路径写法）**：`pwsh -EncodedCommand <base64>` 此前只能被当成不透明命令从严拦下，现在网关会解码（UTF-16LE / UTF-8 都试，且要求解出来确实像命令）并以 `decoded_command` 一并交给分类器——编码不是风险，内容才是；解不出来时保持原样从严判定。同时，`live_cwd` 是 Git Bash 写法（`/c/Users/me/proj`）而命令里写 Windows 原生路径（`C:\Users\me\proj`）时，上下文会点破两者是同一位置，避免"项目内"被判成"项目外"。
+- **Windows 只读操作与状态变更分开**：`Get-Service` / `sc query` / `Get-EventLog` / `Get-CimInstance` / `winget list` 等查询放行；`Set-Service` / `Start-Service` / `Stop-Service` / `Start-Process -Verb RunAs` 等改机器状态的照旧拦截；项目内 `.ps1` / `.cmd` / `.bat` 脚本与 `pwsh -File` 按"跑项目自己的脚本"处理。
+- **非流式响应也回传裁决**：此前只有流式响应带 `safeguard_results`，非流式响应体里没有这一项。Claude Code 的流看门狗在流中断时会回退到非流式请求，缺这一份裁决就只能退回它自己的本地分类器。现在两条路径共用 `safeguards::results_for_content`，对"什么时候回空表"给出一致答案。
+- **判据从"工具名"扩展到"工具名或输入形态"**：入参里带 `command` / `cmd` / `script` 等命令字段的调用一律分类，MCP 命令工具与将来改名的 shell 工具不会再因为名字不在名单里而拿不到裁决。
+- **拦截理由进日志**：`safeguards 分类器` 的日志现在带上每条 flagged 裁决的理由（截断 120 字符），排查误拦不必再靠复现。
 - **修复 release Docker 镜像启动失败**：`Dockerfile.release` 运行层从 Alpine 改为 Debian slim，兼容 `cargo build --release` 产出的 glibc 动态链接 Linux 二进制，并在镜像构建阶段执行 `/app/kiro-rs --version` 早失败校验，避免发布后出现 `exec ./kiro-rs: no such file or directory`。
 
 ## [2026.1.8] - 2026-06-10
